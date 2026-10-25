@@ -12,13 +12,13 @@ pip3 install .
 )
 
 # Compile ASTRA-sim with analytical backend model
-(
-cd ${REPO_ROOT}/astra-sim
-bash ./build/astra_analytical/build.sh
-)
-
-# Compile ASTRA-sim with ns3 backend model
 # (
 # cd ${REPO_ROOT}/astra-sim
-# bash ./build/astra_ns3/build.sh
+# bash ./build/astra_analytical/build.sh
 # )
+
+# Compile ASTRA-sim with ns3 backend model
+(
+cd ${REPO_ROOT}/astra-sim
+bash ./build/astra_ns3/build.sh
+)

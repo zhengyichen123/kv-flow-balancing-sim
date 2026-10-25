@@ -417,7 +417,7 @@ int main(int argc, char* argv[]) {
                 }
                 else{ // add new worklaod
                     // cout << "Adding " << new_filename << endl;
-                    systems[i]->workload->addWorkload(new_filename);
+                    systems[i]->workload->add_workload(new_filename,{});
                 }
             }
         }
