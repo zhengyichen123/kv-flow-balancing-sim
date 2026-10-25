@@ -1,0 +1,72 @@
+# Llama 3.x family — class catalog (dense decoder-only LLMs).
+#
+# This file describes the vLLM class structure for the architecture;
+# per-checkpoint dimensions (hidden_size / num_heads / ...) come from
+# the HF model config selected at the CLI. One architecture covers
+# every size in the family (8B / 70B / 405B / ...).
+#
+# ``rotary_emb`` lists two classes because this one differs by checkpoint
+# rather than by structure: Llama 3 uses ``Llama3RotaryEmbedding`` for its
+# extended rope scaling, while Llama 1/2 and Mistral use the base
+# ``RotaryEmbedding``. Matching takes whichever the loaded checkpoint has, so
+# the catalog covers the family instead of silently measuring nothing there on
+# half of it.
+#
+# Canonical layer names mirror vLLM's attribute names (see
+# ../vllm/vllm/model_executor/models/llama.py).
+#
+# ``sequence:`` describes the ordered pipeline the simulator's
+# trace_generator walks to emit one iteration. Names must appear in
+# ``catalog`` below. TP ALLREDUCE (after ``o_proj`` / ``down_proj``)
+# and EP ALLTOALL (around ``moe``) are attached by the simulator from
+# cluster config and need not be listed here.
+
+
+blocks:
+  attn:
+    full_attention:
+      pre_attn:  [layernorm, qkv_proj, rotary_emb, attention]
+      post_attn: [o_proj, layernorm]
+  mlp:
+    dense: [gate_up_proj, act_fn, down_proj]
+
+shared:
+  prologue:  [embedding]
+  head:      [final_layernorm, lm_head, sampler]
+
+
+catalog:
+  dense:
+    embedding:
+      vllm: VocabParallelEmbedding
+    layernorm:
+      vllm: RMSNorm
+      within: LlamaDecoderLayer
+      tp_stable: true
+    qkv_proj:
+      vllm: QKVParallelLinear
+    rotary_emb:
+      vllm: [Llama3RotaryEmbedding, RotaryEmbedding]
+    o_proj:
+      vllm: RowParallelLinear
+      within: LlamaAttention
+    gate_up_proj:
+      vllm: MergedColumnParallelLinear
+    act_fn:
+      vllm: SiluAndMul
+    down_proj:
+      vllm: RowParallelLinear
+      within: LlamaMLP
+    final_layernorm:
+      vllm: RMSNorm
+      within: LlamaForCausalLM
+      tp_stable: true
+  per_sequence:
+    lm_head:
+      vllm: LogitsProcessor
+    sampler:
+      vllm: Sampler
+      tp_stable: true
+  attention:
+    attention:
+      vllm: Attention

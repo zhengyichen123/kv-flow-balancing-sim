@@ -1,0 +1,283 @@
+# LLMServingSim Documentation Site (`docs/`)
+
+Guidelines for collaborators (humans and AI coding agents) updating the
+LLMServingSim documentation site at https://llmservingsim.ai.
+
+The repo's `README.md` is intentionally minimal and points readers here
+for everything beyond install + run. Long-form content (CLI flag tables,
+dataset schema, profiler walkthroughs, validation results) lives on this
+site, not in the README. See the root `AGENTS.md` for the README and
+docs split.
+
+## Commit policy
+
+The root AGENTS.md commit policy also applies to docs-only changes. Every
+commit includes updates to the root and affected directory READMEs, AGENTS.md,
+CHANGELOG.md and relevant public documentation; regenerate the site changelog.
+Public pages, including contributor guides, describe supported behavior, usage
+and policy, never development-session notes or intermediate experiments.
+Do not commit temporary diagnostic or fix-verification scripts, tests or
+generated experiment results. Review the staged diff before committing.
+
+Describe profiling methods directly: collector, CUDA interval aggregation,
+normalization and synthetic input preparation. New CSVs hold coordinates and
+timings; the variant-root `meta.yaml` records methods, observed runtime versions
+and publication evidence. New per-TP records live under `per_tp[tp]`; do not
+document new standalone contract/category/context/callable/skew metadata files.
+Raw repetition checkpoints are acquisition data, not an alternative metadata store.
+Document compact MoE conditioning summaries separately from raw control records.
+Skew metadata is root-only; do not promise a `skew.meta.yaml` read fallback.
+Failure-only diagnostics are optional debugging artifacts, not required simulator
+inputs or material to commit with a profile bundle.
+Use descriptive method/policy/format labels; shared acquisition policy constants
+live in `metadata_names.py`.
+Do not promise old-name aliases. Distinguish legacy file-layout reads from method
+compatibility; preserve real library/model versions, native API identifiers and
+numeric structural schemas.
+Do not document source-file hashes or exact library versions as execution vetoes.
+Keep semantic/API/backend/layout guards and table-integrity checks distinct from
+provenance. Historical timings are never upgraded by restamping metadata, and
+bounded acquisition or duration replay does not establish full serving accuracy.
+Serving graph observations belong in root `meta.yaml.serving_execution`, separate
+from acquisition settings. Preserve explicit instance overrides and document
+scope matching, unknown/incomplete observations and MRV1/MRV2 dispatch separately.
+Completed worker capture is stronger evidence than a frontend requested grid,
+but neither is a graph-specific latency measurement.
+
+## What this is
+
+A [Docusaurus 3](https://docusaurus.io/) site (TypeScript, classic preset)
+that serves the public LLMServingSim documentation. The site is split into
+two top-level navbar sections:
+
+- **For Users** — installation, simulator/profiler/bench guides, configuration
+  reference and validation results.
+- **For Contributors** — onboarding for people developing LLMServingSim itself.
+  Includes codebase, conventions, validation and pull-request guides.
+
+The reference design is the [vLLM docs](https://docs.vllm.ai/en/latest/) —
+sidebar-first navigation, deep hierarchy, audience segmentation.
+
+## Local development
+
+Requirements: **Node.js ≥ 20** (the site uses Docusaurus 3, which dropped
+Node 18 support) and **pnpm**.
+
+```bash
+cd docs/
+pnpm install
+pnpm start          # dev server on http://localhost:3000
+pnpm build          # static build to docs/build/
+pnpm serve          # serve the production build locally
+```
+
+Run `pnpm build` at least once before sending a PR — the dev server is more
+forgiving than the production build (broken links, dead anchors, etc. fail
+the build).
+
+## Repository layout
+
+```
+docs/
+├── docusaurus.config.ts        site metadata, navbar, footer, theme
+├── sidebars.ts                 sidebar trees (userSidebar, contributorSidebar)
+├── docs/                       markdown content (one folder per top-level section)
+│   ├── getting-started/
+│   ├── simulator/
+│   ├── profiler/
+│   ├── validation.md
+│   ├── examples/
+│   ├── workloads/
+│   ├── reference/             includes the bench CLI reference
+│   └── contributor/
+├── src/
+│   ├── pages/index.tsx         landing page (Hero + feature cards)
+│   ├── pages/index.module.css  landing page styles
+│   ├── components/
+│   │   └── HomepageFeatures/   the four feature cards on the landing page
+│   └── css/custom.css          global theme overrides (primary color, etc.)
+└── static/
+    ├── CNAME                   custom domain (llmservingsim.ai)
+    └── img/                    favicon, logo, social card
+        ├── llmservingsim_full_primary_transparent.png       light-mode logo (indigo + black)
+        ├── llmservingsim_full_primary_dark_transparent.png  dark-mode logo (indigo + white)
+        ├── llmservingsim_full_reverse_white_transparent.png all-white reverse
+        ├── llmservingsim_full_mono_black_transparent.png    all-black mono
+        └── llmservingsim_compact_primary_transparent.png    navbar/compact mark
+```
+
+The dark-mode logo is referenced from the root `README.md` via `<picture>` +
+`prefers-color-scheme`; the light variant is the website's hero/navbar
+default with a CSS `invert(1) hue-rotate(180deg)` filter for dark mode.
+
+## Adding a new doc page
+
+1. Pick the section folder under `docs/` (or create a new one, see below).
+2. Create a markdown file:
+
+   ```markdown
+   ---
+   sidebar_position: 3
+   title: Reading the Output
+   ---
+
+   # Reading the Output
+
+   ...content...
+   ```
+
+   `sidebar_position` controls ordering inside the section. `title` controls
+   the sidebar label (defaults to the H1 if omitted).
+
+3. **Add the page to `sidebars.ts` by hand.** The sidebars are explicit item
+   lists, not autogenerated from the folder structure, so a new page is
+   unreachable until it is listed — and `docusaurus build` passes anyway,
+   because an orphan is not a broken link. Three pages shipped that way
+   (`examples/model-families/*`, `examples/advanced/speculative-decoding`).
+   To check for orphans, compare every `docs/docs/**/*.md*` path against the
+   ids quoted in `sidebars.ts`.
+
+## Adding a new section (top-level folder)
+
+1. Create the folder, e.g. `docs/new-section/`.
+2. Add a `_category_.json`:
+
+   ```json
+   {
+     "label": "New Section",
+     "position": 8,
+     "link": {
+       "type": "generated-index",
+       "description": "What this section is about."
+     }
+   }
+   ```
+
+3. Add the section to `sidebars.ts` under `userSidebar` or `contributorSidebar`.
+
+## Editing the landing page
+
+- **Hero** (title, tagline, buttons): `src/pages/index.tsx`
+- **Feature cards** (the four icons + text below the hero):
+  `src/components/HomepageFeatures/index.tsx` — edit the `FeatureList` array.
+- **Hero / card styles**: `src/pages/index.module.css` and
+  `src/components/HomepageFeatures/styles.module.css`.
+- **Global colors / fonts**: `src/css/custom.css`.
+
+## Editing navbar / footer / metadata
+
+`docusaurus.config.ts`:
+
+- `title`, `tagline`, `url`, `favicon` — top-level site metadata
+- `themeConfig.navbar.items` — nav links (sidebar links use `type: 'docSidebar'`)
+- `themeConfig.footer.links` — footer columns
+- `presets[0][1].docs.editUrl` — "Edit this page" link target
+
+## Deployment
+
+The site auto-deploys via GitHub Actions on every push to `main` that
+touches `docs/**`:
+
+1. Action checks out the repo and installs Node 22 + pnpm.
+2. Runs `pnpm install --frozen-lockfile && pnpm build` in `docs/`.
+3. Uploads `docs/build/` as a Pages artifact via
+   `actions/upload-pages-artifact@v3`.
+4. `actions/deploy-pages@v4` publishes the artifact to GitHub Pages
+   (repo Settings → Pages → Source = **GitHub Actions**). The custom
+   domain `llmservingsim.ai` is preserved by `docs/static/CNAME`.
+
+A successful deploy typically takes ~2 minutes after the merge. If the
+build fails, the previous deploy stays live.
+
+The Pages-source toggle (`GitHub Actions` vs. `Deploy from a branch`)
+is a one-time repo-settings choice; the workflow runs but the deploy
+step is silently a no-op if the source is set to anything else.
+
+## Conventions
+
+- **README structure**: follow the root AGENTS.md layout/tree conventions and
+  the contributor guide's README and Markdown formatting section. Keep the opening
+  introduction brief and place detailed contracts under topic headings after usage
+  entry points, rather than appending implementation changes to the introduction. Keep roadmap
+  announcements distinct from implemented and validated behavior. Root Getting
+  Started contains only setup/run commands, runtime requirements and links;
+  do not expand it with measurement details, model-specific restrictions or
+  contribution-policy text.
+- **Language**: English only. Match the rest of the LLMServingSim repo.
+- **Changelog**: edit the root source, not the generated page. Keep each change
+  category once per release, summarize final user-visible effects, and retain
+  upgrade requirements and contributor credit. Follow the
+  [entry guidelines](docs/contributor/pr-workflow.md#changelog-entries).
+  Check release-range commits and net changes, including submodules, rather
+  than treating the previous changelog as a complete inventory.
+- **CLI references**: compare registered options, negative boolean forms,
+  defaults and subcommand scope with the complete reference and directory
+  README index before release. Verify wrapper forwarding with engines disabled.
+  Keep the root README as a link to those references, not a duplicate flag list.
+- **Runtime contracts**: distinguish measured per-TP backend semantics from
+  historical compatibility rules. A native attention lookup cap is neither a
+  rewrite of raw CSV coordinates nor a KV-capacity limit; document publication
+  checks and supported source/layout scope without generalizing a bounded probe
+  into full-grid, distributed-deployment or benchmark validation.
+- **Code blocks**: always specify the language (` ```bash `, ` ```python `,
+  ` ```yaml `). The site's Prism config preloads bash, python, json, yaml.
+- **Images**: under `static/img/`, reference as `/img/<file>.png`.
+- **Internal links**: use relative paths like `/docs/simulator/cli-overview`,
+  not full URLs. `onBrokenLinks: 'throw'` will fail the build on dead links.
+- **Component names**: PascalCase (`HomepageFeatures`).
+- **File naming**: `kebab-case.md` for docs, matches the URL slug.
+- **Admonitions**: the title goes in **brackets** — `:::caution[Title here]`,
+  closed by `:::`. The bare form `:::caution Title here` is Docusaurus v2 syntax:
+  v3 does not recognise it as a directive, so the whole block renders as a
+  literal paragraph starting `:::caution ...`. Nothing warns — not the build, not
+  `onBrokenLinks: 'throw'` — and it sat on 13 pages before anyone looked at the
+  rendered output. A titleless `:::note` needs no brackets.
+- **A fact the code owns does not go in prose.** Counts, file lists, flag sets,
+  defaults: if a script or config decides it, prose that repeats it goes silently
+  wrong the first time the code changes, and readers take prose as specification.
+  Write "every scenario in `serving/validate-baselines.txt`", not "58 scenarios".
+  Sample output and quoted examples are exempt — readers already read a terminal
+  block or a blockquote as a snapshot from one particular run. Point at the
+  generator instead of mirroring it: `--list` and `--help` cannot go stale.
+
+## Checks that run on the site
+
+- `pnpm build` runs two hooks around it. `prebuild` regenerates
+  `src/pages/changelog.md` from the repo-root `CHANGELOG.md`
+  (`scripts/sync-changelog.mjs`) — **edit `CHANGELOG.md` only**; the page is
+  generated, and committed so a fresh clone works. `postbuild` runs
+  `scripts/check-rendered.mjs`.
+- `scripts/check-rendered.mjs` scans the built HTML for source syntax that
+  survived into visible text — unparsed admonitions, bold, links, headings, table
+  rows, doubled list markers, visible HTML comments, JSX brace leaks. It strips
+  `<pre>`/`<code>`/`<script>` first, since syntax is legitimate there, and exits
+  non-zero on any hit. It exists because this whole class of bug is *not an
+  error*: markup Docusaurus cannot parse becomes text, so the only way to catch
+  it is to look at the output. Run it with `pnpm check-rendered` after a build.
+- **Mermaid is checked structurally, from the source.** theme-mermaid leaves no
+  `<pre class="mermaid">` in the static HTML — the diagram source goes into the JS
+  bundle and renders in the browser — so the HTML scan cannot see diagrams at all.
+  The checker reads the ```` ```mermaid ```` blocks out of the `.md`/`.mdx` files
+  instead and reports `file:line`. It catches an unknown diagram type, an empty
+  diagram, and a `subgraph` with no matching `end`.
+  **It is not mermaid's parser**, which needs a DOM even to parse
+  (`mermaid.parse()` in bare node fails on `DOMPurify.addHook`) and would mean a
+  `jsdom` dependency. So bad node syntax inside a structurally sound diagram, and
+  anything visual — overflow, colour contrast, a diagram that renders but says the
+  wrong thing — still needs you to open the page.
+
+## Things explicitly **not** in scope yet
+
+These are deferred until the site has more content and traction:
+
+- Algolia DocSearch integration
+- Versioned docs (latest vs. v1.x.y)
+- Internationalization
+- Versioned changelog archives (the current changelog is generated locally)
+- Blog
+- API reference auto-generation from Python source
+
+## Reference site
+
+When in doubt about layout or tone, look at the vLLM docs:
+[https://docs.vllm.ai/en/latest/](https://docs.vllm.ai/en/latest/).
