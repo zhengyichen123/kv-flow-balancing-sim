@@ -9,6 +9,9 @@
 #include "ns3/csma-module.h"
 #include "ns3/internet-module.h"
 #include "ns3/network-module.h"
+#include <algorithm>
+#include <cassert>
+#include <cstdlib>
 #include <execinfo.h>
 #include <fstream>
 #include <iostream>
@@ -148,6 +151,9 @@ class ASTRASimNetwork : public AstraSim::AstraNetworkAPI {
     virtual void sim_schedule(AstraSim::timespec_t delta,
                               void (*fun_ptr)(void* fun_arg),
                               void* fun_arg) {
+        // Same contract as CommonNetworkApi::sim_schedule: deltas are always
+        // nanoseconds, and ns-3 schedules are relative to Now().
+        assert(delta.time_res == AstraSim::NS);
         Simulator::Schedule(NanoSeconds(delta.time_val), fun_ptr, fun_arg);
         return;
     }
@@ -242,7 +248,10 @@ bool rendezvous_protocol = false;
 auto logical_dims = vector<int>();
 int num_npus = 1;
 auto queues_per_dim = vector<int>();
-static constexpr uint64_t idle_ticks = 100;
+// Same idle quantum the analytical backend uses when its event queue runs dry
+// (EventQueue::add_current_time() advances 1 ms). Keeping both backends at
+// 1 ms makes `pass <tick>` deadlines mean the same thing to the frontend.
+static constexpr uint64_t idle_ticks = 1000000;
 
 // TODO: Migrate to yaml
 void read_logical_topo_config(string network_configuration,
@@ -389,37 +398,120 @@ int main(int argc, char* argv[]) {
     }
 
     // Tell workload layer to schedule first events.
+    // PreRun() must run first: it records the main thread id that
+    // Simulator::Schedule() asserts on.
+    Simulator::PreRun();
+    // Optional guard on simulated time. SIMULATOR_STOP_TIME is in nanoseconds,
+    // matching sim_get_time() and the `pass <tick>` handshake. It is checked at
+    // the top of the loop rather than scheduled as a Stop event: a pending
+    // Stop event would keep DefaultSimulatorImpl::IsFinished()
+    // (`m_events->IsEmpty() || m_stop`) false, which would starve the idle
+    // quantum that advances Now() towards the next `pass <tick>` deadline.
+    const bool has_stop_time = simulator_stop_time > 0;
     for (int i = 0; i < num_npus; i++) {
         systems[i]->workload->fire();
     }
 
     // Run the simulation by triggering the ns3 event queue.
-    // Simulator::Run();
-    Simulator::PreRun();
+    // This loop mirrors analytical/congestion_aware/main.cc so both backends
+    // understand the same handshake: a rank is asked only when it is runnable
+    // (not sleeping), finished, and not suppressed by the `pass <tick>` it
+    // received in the current state generation.
+    constexpr long long kSuppressionBackstop = 1000;
+    vector<long long> pass_gen(num_npus, -1);     // -1 = askable
+    vector<long long> pass_deadline(num_npus, 0); //  0 = no deadline
+    vector<long long> last_reported_iter(num_npus, -1);
+    long long state_gen = 0;
+    long long unasked_rounds = 0;
+
+    auto askable = [&](int npu_id) {
+        if (pass_gen[npu_id] < 0)
+            return true;
+        if (pass_gen[npu_id] != state_gen)
+            return true;
+        if (pass_deadline[npu_id] > 0 &&
+            static_cast<long long>(Simulator::Now().GetNanoSeconds()) >=
+                pass_deadline[npu_id])
+            return true;
+        return false;
+    };
+    auto clear_suppression = [&]() {
+        std::fill(pass_gen.begin(), pass_gen.end(), -1);
+    };
+
     bool exit = false;
     while (!exit) {
-        if(Simulator::IsFinished()){
+        if (has_stop_time &&
+            static_cast<long long>(Simulator::Now().GetNanoSeconds()) >=
+                static_cast<long long>(simulator_stop_time)) {
+            cerr << "Reached SIMULATOR_STOP_TIME (" << simulator_stop_time
+                 << " ns); stopping the simulation." << endl;
+            break;
+        }
+
+        bool asked_any = false;
+        if (Simulator::IsFinished()) {
             Simulator::Schedule(NanoSeconds(idle_ticks), [] {});
+            clear_suppression();
         }
         Simulator::RunOneEvent();
+
         for (int i = 0; i < num_npus; i++) {
-            if(systems[i]->workload->is_finished){
-                systems[i]->workload->report();
-                AstraSim::LoggerFactory::get_logger("workload")->info("Waiting");
-                string new_filename;
-                getline(cin, new_filename);
-                if (new_filename.compare("pass") == 0){ // if pass
-                    continue;
-                }
-                else if (new_filename.compare("exit") == 0){ // exit the simulator
-                    exit = true;
-                    break;
-                }
-                else{ // add new worklaod
-                    // cout << "Adding " << new_filename << endl;
-                    systems[i]->workload->add_workload(new_filename,{});
-                }
+            if (systems[i]->workload->is_sleep)
+                continue;
+            if (!systems[i]->workload->is_finished)
+                continue;
+            if (!askable(i))
+                continue;
+
+            asked_any = true;
+            if (static_cast<long long>(systems[i]->workload->iteration) !=
+                last_reported_iter[i]) {
+                last_reported_iter[i] = systems[i]->workload->iteration;
+                ++state_gen;
             }
+            systems[i]->workload->report();
+            AstraSim::LoggerFactory::get_logger("workload")->info("Waiting");
+
+            string new_filename;
+            getline(cin, new_filename);
+
+            if (new_filename.rfind("pass", 0) == 0) {
+                // "pass"     -> ask again as soon as possible
+                // "pass <t>" -> ask again once the clock reaches <t>
+                // "pass -1"  -> the frontend's state changed; ask again now
+                const long long deadline = (new_filename.size() > 5)
+                    ? std::strtoll(new_filename.c_str() + 5, nullptr, 10)
+                    : 0;
+                if (deadline < 0) {
+                    ++state_gen;
+                    pass_gen[i] = state_gen;
+                    pass_deadline[i] = 0;
+                } else {
+                    pass_gen[i] = state_gen;
+                    pass_deadline[i] = deadline;
+                }
+                continue;
+            }
+
+            ++state_gen;
+            pass_gen[i] = -1;
+
+            if (new_filename == "exit") {
+                exit = true;
+                break;
+            } else if (new_filename == "done") {
+                systems[i]->workload->is_sleep = true;
+            } else {
+                systems[i]->workload->add_workload(new_filename, {});
+            }
+        }
+
+        if (asked_any) {
+            unasked_rounds = 0;
+        } else if (++unasked_rounds >= kSuppressionBackstop) {
+            unasked_rounds = 0;
+            clear_suppression();
         }
     }
     completion_tracker->check_all_ranks_finished();

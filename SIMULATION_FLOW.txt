@@ -1,0 +1,470 @@
+================================================================================
+LLMServingSim 完整仿真流程 与 关键文件导读
+================================================================================
+适用版本：当前仓库（serving/ 前端 + astra-sim/ 后端）
+阅读目标：跑通一次仿真、看懂主循环、知道改某个行为该动哪个文件。
+
+--------------------------------------------------------------------------------
+0. 一句话总览
+--------------------------------------------------------------------------------
+LLMServingSim 是一个"两段式"仿真器：
+
+  Python 前端（serving/）           ASTRA-Sim 子进程（astra-sim/）
+  ------------------------          ------------------------------
+  请求到达 / 路由 / 批调度           计算时间（算子级）与时序推进
+  KV cache 分配 / 抢占 / 前缀缓存    集合通信（TP/PP/EP/DP）
+  MoE / PD 分离 / 投机解码           网络建模（analytical 或 ns-3）
+  功耗与能耗统计
+        |                                      |
+        +---------- stdin / stdout 文本握手 ----+
+
+前端不是"调用一个函数算完"，而是每轮拿一个 batch，现场生成一份 Chakra 图
+（.et 文件），把路径写给后端；后端跑完这一轮，把"哪个 NPU、第几次迭代、
+用了多少 cycle"打印出来，前端再决定下一轮。
+
+所以：整个仿真的时间轴由 ASTRA-Sim 推进，业务逻辑由 Python 决定。
+
+
+--------------------------------------------------------------------------------
+1. 仓库目录地图（先建立空间感）
+--------------------------------------------------------------------------------
+LLMServingSim/
+├── serving/                  Python 前端（你 90% 的调试都在这里）
+│   ├── __main__.py           主程序：参数解析 + 主循环 + 收尾（核心中的核心）
+│   ├── run.sh                官方示例命令清单（每个特性一条，强烈建议先看）
+│   ├── validate.sh           与真实框架基线对比的校验脚本
+│   └── core/                 各类子系统（见第 5 节）
+├── configs/
+│   ├── cluster/              集群配置 JSON（34 个）+ README.md（最权威的字段说明）
+│   ├── model/                按厂商分目录的模型结构配置（llama/qwen/deepseek/...）
+│   ├── pim/                  PIM（存算一体）模型参数
+│   └── spec_decode.json      投机解码接受率表
+├── workloads/                请求 trace（.jsonl，一行一个请求或会话）
+├── profiler/                 离线性能剖析器
+│   └── perf/<硬件>/<模型>/<变体>/tp<N>/   实测算子耗时 CSV（trace 生成的数据源）
+├── astra-sim/                ASTRA-Sim 本体（后端）
+│   ├── astra-sim/            C++ 源码（network_frontend/{analytical,ns3} 等）
+│   ├── extern/network_backend/{analytical,ns-3}/   两个网络后端实现
+│   ├── build/astra_analytical/build.sh             analytical 后端编译脚本
+│   ├── build/astra_ns3/build.sh                    ns-3 后端编译/独立调试脚本
+│   └── inputs/               后端输入（含运行时生成的 runs/<run_id>/）
+├── outputs/                  仿真结果 CSV
+├── scripts/compile.sh        一键编译两个后端
+└── docs/  bench/              文档与基准
+
+
+--------------------------------------------------------------------------------
+2. 端到端流程（一次 `python -m serving ...` 到底发生了什么）
+--------------------------------------------------------------------------------
+下面 8 步对应 serving/__main__.py 的 main()。
+
+【第 1 步】切工作目录（极易踩坑）
+  位置：__main__.py:526-533
+    cwd = os.getcwd()
+    os.chdir(os.path.join(cwd, "astra-sim"))
+  含义：进入 main 之后，进程 CWD 变成 <repo>/astra-sim/。
+  后果：
+    - 代码里所有相对路径（inputs/...、profiler/perf/...）都以 astra-sim/ 为基准；
+    - 但用户从命令行传入的路径（--dataset、--gate-stats）在 chdir 之前就被
+      转成绝对路径（__main__.py:689-705），所以你从仓库根目录调用是安全的。
+    - --output 相对路径同样在 chdir 前解析成绝对路径（_resolve_output_file）。
+
+【第 2 步】解析参数
+  位置：__main__.py:534-705
+  必看参数（只用这几个就能跑起来）：
+    --cluster-config   集群拓扑与模型，默认 configs/cluster/single_node_single_instance.json
+    --dataset          请求 trace，例如 workloads/example_trace.jsonl
+    --num-reqs         只跑前 N 条请求（0 = 全跑）
+    --output           结果 CSV，支持 {run_id} 占位符
+    --network-backend  analytical（默认）| ns3
+  常用开关：
+    --block-size / --max-num-seqs / --max-num-batched-tokens
+    --enable-prefix-caching（默认开）/ --enable-chunked-prefill（默认开）
+    --enable-prefix-sharing / --prefix-storage None|CPU|CXL
+    --enable-local-offloading / --enable-attn-offloading
+    --enable-sub-batch-interleaving / --async-scheduling
+    --num-speculative-tokens / --spec-acceptance-rate / --spec-acceptance-policy
+    --request-routing-policy LOAD|RR|RAND|CUSTOM
+    --expert-routing-policy BALANCED|RR|RAND|CUSTOM
+    --run-id / --inputs-root / --keep-inputs / --save-trace-text
+    --log-interval / --log-level WARNING|INFO|DEBUG
+
+【第 3 步】生成本次运行的四件套配置
+  位置：__main__.py:724-747 → serving/core/config_builder.py:318 build_cluster_config()
+  输入：configs/cluster/xxx.json（+ configs/model/ 里的模型结构 + profiler/perf 里的硬件参数）
+  输出（全部落在 astra-sim/inputs/runs/<run_id>/ 下）：
+    network/network.yml     拓扑维度、链路带宽/延迟、NPU 数量
+    system/system.json      NPU 侧算力/访存参数
+    memory/memory_expansion.json
+    （run_id 未指定时自动生成 run_<微秒时间戳>_<pid>，见 core/run_paths.py:19）
+  同时算出：
+    total_npu、num_instances、start/end_npu_ids
+    inst2node_mapping / inst2npu_mapping / npu2inst_mapping
+    prefill_instance / decode_instance（PD 分离时用）
+  缺失的硬件字段（link_bw、link_latency、npu_mem 等）会从
+  profiler/perf/<hardware>/hardware.yaml 自动继承（core/hardware_defaults.py）。
+
+【第 4 步】构建运行时对象
+  位置：__main__.py:763-905
+    - 每个实例一个 Scheduler（core/scheduler.py）：
+        负责 waiting/running 队列、token budget、chunked prefill、抢占、KV 分配、
+        完成回调 add_done()、结果汇总 print_result()/save_output()
+    - 一个 Controller（core/controller.py）：负责与 ASTRA-Sim 的握手读写
+    - 一个 Router（core/router.py）：
+        从 dataset 读请求、按到达时间投放、按策略（LOAD/RR/RAND/CUSTOM）
+        分给实例、PD 分离时把 prefill 完成请求转给 decode 实例
+    - 可选：PowerModel（core/power_model.py）、PIMModel、GateRouter（MoE 专家路由）
+    - 打印 KV cache 容量估算（由 npu_mem 与模型结构推出来）
+
+【第 5 步】生成"开场" workload
+  位置：__main__.py:935-946
+    event_trace = generate_event(event_time)            # core/trace_generator.py:2900
+    generate_graph(..., event=True, trace=event_trace)   # core/graph_generator.py:140
+    workload = get_workload(..., event=True)             # core/utils.py:41
+  作用：在第一条请求到达之前，先让后端空转推进时间（event_handler 图）。
+  event_time = min(第一条请求到达时间, log_interval)。
+
+【第 6 步】启动 ASTRA-Sim 子进程
+  位置：__main__.py:748-762（选二进制与参数）、948-959（Popen）
+  analytical 后端：
+    build/astra_analytical/build/AnalyticalAstra/bin/AnalyticalAstra
+      --workload-configuration=<workload 前缀>
+      --system-configuration=<run 内 system.json>
+      --network-configuration=<run 内 network.yml>
+      --memory-configuration=<run 内 memory_expansion.json>
+      --start-npu-ids=... --end-npu-ids=...
+  ns-3 后端：
+    extern/network_backend/ns-3/build/scratch/ns3.42-AstraSimNetwork-default
+      同上四个参数，但改为
+      --logical-topology-configuration=<run 内 ns3/logical_topology.json>
+      并且不传 start/end-npu-ids。
+      ns-3 的物理拓扑与输出路径由 _prepare_ns3_config()（__main__.py:163-215）
+      基于 extern/network_backend/ns-3/scratch/config/config.txt 模板生成到
+      astra-sim/inputs/runs/<run_id>/ns3/config.txt。
+  注意：--workload-configuration 传的是"前缀"，后面不带 .et；
+        Chakra 图实际文件是 <前缀>.<rank>.et，每个 rank 一个。
+
+【第 7 步】主循环（真正的仿真，__main__.py:1015-1524）
+  每一轮的固定顺序：
+    1) out = controller.read_wait(p)          # 阻塞等后端说 Waiting
+    2) parse_output(out[-2]) -> sys/id/cycle  # 哪个 NPU、第几轮、当前时刻(ns)
+    3) router.route_arrived_requests(current) # 把到时间的请求投给实例
+    4) schedulers[inst].add_done(id, sys, current)
+       -> 上一批的 prefill_tokens / gen_tokens / 已完成的请求
+    5) router.notify_request_completed(...)   # 已完成请求从系统里摘掉
+       router.transfer_prefill_request(...)   # PD 分离：prefill -> decode
+    6) new_req = schedulers[inst].schedule(current, sys, id)
+       调度器决定这个 NPU 这一轮跑什么（prefill / decode / 混合 / 空转）
+    7) 四个分支决定回什么给后端：
+       a. DP 组已凑齐 -> 把预生成的 workload 路径交出去
+       b. DP 组没凑齐 -> 空闲成员造 dummy batch 参与同一波集合通信
+       c. new_req 非空 -> generate_trace -> generate_graph -> get_workload
+          -> write_flush(workload 路径)
+       d. 什么都不做 -> write_flush(pass / pass <tick> / pass -1)
+    8) 按 --log-interval 打印吞吐（tokens/s）
+    9) 完成判定：某实例队列空 + 无待到达请求 + 无延迟会话
+       - 全部实例都完成 -> write_flush("exit") -> break
+       - 只有它完成     -> write_flush("done") 让它休眠
+   10) 没有任何 batch 可发时的兜底：
+         pass_msg = _pass_response(router, current)   # __main__.py:76-100
+         若下一个请求在将来且有 pending，则本地 current 直接跳到 next_arrival
+
+  DP（数据并行）同步组额外逻辑（__main__.py:961-1008）：
+    - dp_group 相同的多个实例必须"同一步"跑同一波集合通信；
+    - dp_pending[group][member] 是 FIFO（pp>1 时一个成员可能有多个 batch 等这一波）；
+    - dp_ready_workloads[npu] 是 FIFO（预生成的图，等对应 NPU 来取）；
+    - _pad_dp_round() 会把一组 batch pad 到相同形状，模拟 vLLM 的 CUDA graph padding；
+    - 每轮结束按 (parent, consumer) 分组，删除超出 reap_window = max(pp)+1 的旧
+      workload 目录，防止长跑把磁盘写满（__main__.py:986-1013）。
+
+【第 8 步】收尾与产出
+  位置：__main__.py:1526-1628
+    controller.check_end(p)           # 确认后端正常退出
+    total_latency = current / FREQ    # FREQ = 1e9
+    打印：总吞吐、TTFT/TPOT 等聚合指标、前缀缓存命中率、功耗/能耗（若开启）
+    每实例 schedulers[i].print_result()
+    save_output(output_file, i>0 时 append)   -> outputs/xxx.csv
+    默认删除 astra-sim/inputs/runs/<run_id>/
+      除非 --keep-inputs 或 --save-trace-text
+
+
+--------------------------------------------------------------------------------
+3. 前后端握手协议（想改后端或调试卡死，必须懂这个）
+--------------------------------------------------------------------------------
+Python 侧实现：serving/core/controller.py（全文 72 行）
+
+  前端 -> 后端（写一行，\n 结尾）：
+    <workload 前缀路径>   让后端加载这份 Chakra 图跑一轮
+    pass                  本轮跳过（不推进业务时间）
+    pass <tick>           跳过，直到时间 tick（ns），用于"等下一个请求到达"
+    pass -1               跳过，但表示"前端状态有变化"（等同 pass 的加强版）
+    done                  本 NPU 暂时没有工作，进入休眠
+    exit                  全部结束，后端退出
+
+  后端 -> 前端（stdout）：
+    "sys[<rank>] iteration <n> finished, <X> cycles, exposed communication <Y> cycles."
+    ...然后打印 "Waiting"（或 "Checking Non-Exited Systems ..."）
+
+  Controller.read_wait() 会一直 readline，直到某一行的最后一行含 "Waiting"，
+  或者正好等于 "Checking Non-Exited Systems ...\n" 才返回。
+  Controller.parse_output(out[-2]) 用正则 _ITERATION_RE 抽出 sys / iteration / cycles。
+
+  关键点：
+    - 后端每跑完一轮就要"报告 + 等指令"，前端不回就永远卡住；
+    - 前端 print 的日志绝不能混进 stdout（会污染协议），日志走 stderr/文件；
+    - 前端一旦挂掉，后端 read 到 EOF 就该优雅退出，而不是死循环。
+
+  时间单位：
+    全系统统一 ns。FREQ = 1e9（__main__.py:924）。
+    "空转一个 log-interval" 在后端是 idle_ticks = 1000000（1 ms）；
+    analytical 侧对应 EventQueue::add_current_time() += 1e6 ns。
+
+
+--------------------------------------------------------------------------------
+4. 配置文件：你需要认识哪些、各自管什么
+--------------------------------------------------------------------------------
+(4.1) configs/cluster/*.json —— 最常改的文件
+  权威字段说明：configs/cluster/README.md（务必读一遍，337 行，含 34 个示例用途表）
+  顶层：
+    num_nodes            节点数
+    link_bw              GiB/s。可写标量（全局广播）或按维度数组；省略则从
+                         profiler/perf/<hw>/hardware.yaml 继承
+    link_latency         ns
+    collective_links     仅 analytical Ring 用
+  每个 node：
+    num_instances
+    cpu_mem.{mem_size(GiB), mem_bw(GB/s), mem_latency(ns)}
+    instances[]
+  每个 instance：
+    model_name           必须是 configs/model/ 里能找到的模型（HF 风格名）
+    hardware             必须对应 profiler/perf/<hardware>/
+    npu_mem.{mem_size, mem_bw, mem_latency, mem_util}
+    pd_type              null | "prefill" | "decode"（PD 分离）
+    num_npus / tp_size / pp_size   约束：num_npus = tp_size * pp_size
+    ep_size              MoE 专家并行度，须整除 num_local_experts
+    dp_group             "A"/"B"...，同名的实例组成一个同步 DP 组
+    cudagraph            CUDA graph 形状（vLLM 风格 padding）
+    以及一批 per-instance 运行时覆盖（优先级：per-instance > 命令行）
+  可选块：placement / power / cxl_mem / pim_config
+  并行约束（README 253-290）：
+    - DP 组内 tp/pp/ep 必须一致；
+    - MoE 组内 ep_size / dp_group_size <= tp_size；
+    - 逻辑拓扑维度：[tp] 或 [tp, pp] 或 [tp, dp_group_size] 或 [tp, pp, dp_group_size]
+      （dp_group_size = 同组实例数 × ...，具体由 _compute_network_dims 产出）
+
+  最小可跑示例：configs/cluster/single_node_single_instance.json
+    num_nodes=1, link_bw=16 GiB/s, link_latency=20000 ns
+    单实例：Llama-3.1-8B + RTXPRO6000 + 1 NPU + tp=1
+
+(4.2) configs/model/** —— 模型结构
+  按厂商分目录（meta-llama / Qwen / deepseek-ai / MiniMaxAI / microsoft /
+  mistralai / moonshotai / zai-org）。由 serving/core/utils.py 的
+  get_config() / get_architecture() / get_layer_stack() 读取。
+  改层数、hidden、专家数、KV 头数等结构参数 -> 动这里。
+
+(4.3) workloads/*.jsonl —— 请求负载
+  一行一条。普通请求字段：arrival_time_ns / input_toks / output_toks
+  （可带 input_tok_ids / output_tok_ids；不给 id 时按长度构造）。
+  agentic 会话（sharegpt/swe-bench 系列）是多轮会话格式。
+  加载入口：core/router.py:103 load_requests()，会话格式走 _load_agentic_session()。
+  自带示例：
+    example_trace.jsonl
+    sharegpt-llama-3.1-8b-300-sps10.jsonl
+    sharegpt-qwen3-32b-300-sps10.jsonl
+    sharegpt-deepseek-v32-16l64e-300-sps10.jsonl（MoE）
+    swe-bench-qwen3-30b-a3b-50-sps0.2.jsonl（agentic）
+    workload_me2_01_mixed.jsonl
+  workloads/generators/ 下是生成脚本。
+
+(4.4) profiler/perf/<hardware>/<model>/<variant>/tp<N>/ —— 性能数据库（只读数据源）
+  trace_generator.py 从这里查算子耗时表、做线性插值。
+  profiler/perf/<hardware>/hardware.yaml 提供 link_bw / link_latency /
+  npu_mem 等硬件默认值（集群配置省略时的继承来源）。
+  当前仓库只有 RTX4090、RTXPRO6000 两套硬件数据。
+  想加新硬件 -> 先跑 profiler/（profile.sh / profile-all.sh）。
+
+(4.5) 其他
+  configs/pim/*.ini             PIM（存算一体）时序参数（DDR4/HBM2/LPDDR4X/LPDDR5）
+  configs/spec_decode.json      投机解码接受率表（spec_decode.py 读取）
+  astra-sim/inputs/memory/*.json  内存扩展方案（CXL / memory pool 等）
+  astra-sim/inputs/logical_topology/logical_8nodes_1D.json
+                                 仅供 build.sh 独立调试，正常由前端动态生成
+  astra-sim/extern/network_backend/ns-3/scratch/config/config.txt
+                                 ns-3 配置模板（拓扑文件、输出文件路径）
+  astra-sim/extern/network_backend/ns-3/scratch/topology/*.txt
+                                 ns-3 物理拓扑（8 节点 / 128 节点两种）
+
+
+--------------------------------------------------------------------------------
+5. 代码文件：按职责索引
+--------------------------------------------------------------------------------
+【编排 / 主循环】
+  serving/__main__.py                    唯一入口。参数、主循环、收尾都在这。
+                                         改"什么时候发什么指令给后端"就改这里。
+
+【配置生成】
+  serving/core/config_builder.py         build_cluster_config()：集群 JSON -> network.yml
+                                         + system.json + memory_expansion.json
+  serving/core/hardware_defaults.py      从 profiler/perf/<hw>/hardware.yaml 补默认值
+  serving/core/run_paths.py              run_id 与 inputs/runs/<run_id>/ 路径布局
+  serving/core/utils.py                  模型配置读取、模型结构、get_workload() 路径拼接
+
+【请求与调度（业务核心）】
+  serving/core/request.py                Request / Batch / RequestStatus 数据模型
+  serving/core/router.py                 请求到达、路由策略、PD 转交、会话管理
+  serving/core/scheduler.py              每实例调度器：schedule() / add_done() / 抢占
+  serving/core/block_pool.py             KV block 池与空闲队列
+  serving/core/kv_cache_manager.py       分层 KV（GPU/CPU/CXL）、前缀缓存与共享
+  serving/core/cudagraph.py              CUDA graph 形状解析与 batch padding
+
+【图生成（把 batch 变成 Chakra .et）】
+  serving/core/trace_generator.py        generate_trace() + generate_event()
+                                         查 profiler 表，产出逐层算子行
+  serving/core/graph_generator.py        generate_graph()：算子行 -> Chakra .et 文件
+                                         带图缓存（相同形状复用）
+  serving/core/component_sizes.py        张量尺寸推导 / 覆盖校验
+  serving/core/moe_components.py         MoE 专家分组与组件表
+  serving/core/moe_execution.py          MoE 执行展开（含 EP 通信）
+  serving/core/communication.py          通信量估算（vocab shard 等）
+  serving/core/pim_model.py              PIM 时序
+  serving/core/power_model.py            功耗/能耗模型
+  serving/core/spec_decode.py            投机解码接受率模型
+  serving/core/gate_function.py          MoE gate 路由（含离线统计回放）
+
+【前后端协议】
+  serving/core/controller.py             read_wait() / write_flush() / parse_output()
+  serving/core/logger.py                 日志（走 stderr / rich 渲染，不污染协议）
+
+【后端（C++，需要时再看）】
+  astra-sim/astra-sim/network_frontend/analytical/    analytical 前端
+  astra-sim/astra-sim/network_frontend/ns3/           ns-3 前端（AstraSimNetwork.cc）
+  astra-sim/extern/network_backend/analytical/        analytical 后端实现（事件队列）
+  astra-sim/extern/network_backend/ns-3/              ns-3 后端与 scratch 主程序
+  astra-sim/astra-sim/workload/Workload.cc            读 .et、comm group 处理
+  astra-sim/astra-sim/system/                         计算/内存/集合通信建模
+  astra-sim/build/astra_analytical/build.sh           analytical 编译
+  astra-sim/build/astra_ns3/build.sh                  ns-3 编译 + 独立调试入口
+                                                       （正常仿真不会调用它）
+  scripts/compile.sh                                  两个后端一起编译
+
+
+--------------------------------------------------------------------------------
+6. 运行时生成物：一次仿真会在磁盘留下什么
+--------------------------------------------------------------------------------
+astra-sim/inputs/runs/<run_id>/
+├── network/network.yml               拓扑维度（npus_count）、链路
+├── system/system.json                NPU 参数
+├── memory/memory_expansion.json      内存扩展
+├── workload/
+│   ├── event_handler/llm.<rank>.et   开场空转图
+│   └── <hardware>/<model>/
+│        instance<i>_batch<b>/llm.<rank>.et  普通 batch（每 batch 一套，每 rank 一个）
+│        dp_<group>_batch<m>/llm.<rank>.et   DP 波次
+├── traces/*.txt                      --save-trace-text 时的可读 trace
+└── ns3/                              仅 ns3 后端
+     ├── config.txt                    由 scratch/config/config.txt 模板生成
+     ├── logical_topology.json         {"logical-dims": ["tp","pp","dp"]}
+     └── output/{flow,trace,mix.tr,fct,pfc,qlen}.txt
+
+跑完默认整目录删除（__main__.py:1628）。
+想留着排查：加 --keep-inputs 或 --save-trace-text，或显式 --inputs-root。
+注意：_cleanup_inputs_root 只删 inputs/runs/ 之下的目录；指向别处会跳过清理。
+
+
+--------------------------------------------------------------------------------
+7. 编译与后端切换
+--------------------------------------------------------------------------------
+两个后端要分别编译：
+
+  bash scripts/compile.sh
+    = cd astra-sim && bash ./build/astra_ns3/build.sh     （无参数 -> 编译模式）
+  也可以单独：
+    bash astra-sim/build/astra_analytical/build.sh
+    bash astra-sim/build/astra_ns3/build.sh -c
+
+ns-3 的 build.sh 还带独立调试入口（run / debug / special_debug），
+这类入口需要一个 WORKLOAD 前缀。脚本在进入 run 分支时才校验：
+  未显式设置 WORKLOAD 时，自动取 inputs/runs/*/workload/event_handler/llm
+  中最新的一个；都没有才报错。
+正常仿真不需要碰这个脚本 —— Python 前端直接 Popen ns-3 二进制。
+
+切换后端只改一个参数：
+  --network-backend analytical   （默认）
+  --network-backend ns3          （需要物理拓扑；当前最多 128 NPU）
+
+
+--------------------------------------------------------------------------------
+8. 常用命令
+--------------------------------------------------------------------------------
+最简一次运行（single node / single instance / 8B / 10 条请求）：
+
+  python -m serving --cluster-config 'configs/cluster/single_node_single_instance.json' \
+      --block-size 16 \
+      --dataset 'workloads/example_trace.jsonl' \
+      --output 'outputs/example_single_run.csv' \
+      --num-reqs 10
+
+换 ns-3 后端：
+
+  python -m serving --cluster-config 'configs/cluster/single_node_single_instance.json' \
+      --dataset 'workloads/example_trace.jsonl' \
+      --output 'outputs/ns3_run.csv' --num-reqs 10 \
+      --network-backend ns3
+
+想保留中间产物排查：
+
+  python -m serving ... --run-id mydebug --keep-inputs --save-trace-text --log-level DEBUG
+  # 结果在 astra-sim/inputs/runs/mydebug/
+
+更多特性组合（PD 分离 / CXL / PIM / TP+PP / MoE+DP+EP / agentic / 投机解码）
+直接看 serving/run.sh，每个特性一条现成命令。
+
+
+--------------------------------------------------------------------------------
+9. 常见坑（按踩坑概率排序）
+--------------------------------------------------------------------------------
+1) 相对路径基准是 astra-sim/，不是仓库根。
+   自己在代码里新增路径时，记得它已经 chdir 过了。
+2) 前端日志不能写 stdout。stdout 是握手通道，混入任何多余输出，
+   Controller.read_wait() 的匹配就会失效 -> 卡死。
+3) 卡在 "Waiting" 不动 = 后端在等你的指令；卡在 readline = 后端没打印 Waiting。
+   先确认是前端没发，还是后端没回。加 --log-level DEBUG 定位。
+4) 默认跑完删 inputs/runs/<run_id>/。第一次跑建议加 --keep-inputs，
+   对着真实生成的 .et 和 network.yml 看，理解会快很多。
+5) --block-size 不传时来自 perf bundle 元数据（_resolve_block_size），
+   不一定等于你以为的默认值。
+6) ns-3 最多 128 NPU，且逻辑拓扑各维连乘必须等于 total_npu，
+   否则 _prepare_ns3_config 直接抛 ValueError。
+7) 多 DP group 场景下逻辑拓扑维度可能拼不满 total_npu：
+   ns-3 会报错，analytical 会静默按错的拓扑跑。跨多 group 时务必先看
+   network.yml 里的 npus_count。
+8) 每个 batch 都会写一套 .et（即使命中图缓存），长跑注意磁盘；
+   正常有 reap_window 回收，但 --keep-inputs 会全部保留。
+9) 后端异常退出时 stdout 可能先 EOF；如果前端报解析错误，
+   先看 stderr 里 ASTRA-Sim 的真实报错。
+
+
+--------------------------------------------------------------------------------
+10. "我想改 X，该看哪个文件" 速查表
+--------------------------------------------------------------------------------
+  改调度策略（先来先服务/抢占/token budget）   serving/core/scheduler.py
+  改请求路由策略（LOAD/RR/RAND）               serving/core/router.py
+  改 KV 容量、前缀缓存、分层存储                serving/core/kv_cache_manager.py, block_pool.py
+  改 batch 形状 / CUDA graph padding           serving/core/cudagraph.py, __main__._pad_dp_round
+  改生成出来的算子耗时                          profiler/（重新剖析）或 trace_generator.py 的查表逻辑
+  改 Chakra 图结构                             serving/core/graph_generator.py
+  改节点/NPU/模型/并行度                        configs/cluster/*.json（+ README.md）
+  改模型结构参数                                configs/model/<vendor>/*.json|yaml
+  改请求负载                                    workloads/*.jsonl 或 workloads/generators/
+  改功耗/能耗模型                               serving/core/power_model.py
+  改前后端协议                                  serving/core/controller.py
+                                               + astra-sim/astra-sim/network_frontend/*/
+  改网络时序/拓扑                               astra-sim/extern/network_backend/*
+                                               + _prepare_ns3_config()
+  改主循环的决策顺序                            serving/__main__.py:1015-1524
+
+================================================================================
+建议阅读顺序：
+  serving/run.sh  ->  configs/cluster/README.md  ->  serving/__main__.py 的 main()
+  ->  serving/core/controller.py  ->  主循环 1015-1524  ->  按需深入 core/*.py
+================================================================================

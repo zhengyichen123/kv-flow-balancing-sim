@@ -11,6 +11,7 @@ import subprocess
 import argparse
 import json
 import shutil
+import yaml
 from time import time
 from collections import defaultdict, deque
 from pathlib import Path
@@ -140,14 +141,55 @@ def _cleanup_inputs_root(run_paths, logger):
     logger.info("Removed ASTRA-Sim inputs root: %s", inputs_root)
 
 
-def _prepare_ns3_config(astra_sim, run_paths):
+def _select_ns3_topology(astra_sim, total_npu):
+    """Pick a bundled physical topology with enough server nodes for `total_npu`.
+
+    The ns-3 backend maps NPU rank i to ns-3 node i, so the servers must be the
+    leading nodes of the file. Both bundled topologies satisfy that.
+    """
+    topology_dir = os.path.join(astra_sim, "extern/network_backend/ns-3/scratch/topology")
+    candidates = (
+        (8, "8_nodes_1_switch_topology.txt"),
+        (128, "128_nodes_32_switch_topology.txt"),
+    )
+    for capacity, name in candidates:
+        if total_npu <= capacity:
+            return os.path.join(topology_dir, name)
+    raise ValueError(
+        "ns3 backend supports at most %d NPUs with the bundled topologies, got total_npu=%d"
+        % (candidates[-1][0], total_npu))
+
+
+def _prepare_ns3_config(astra_sim, run_paths, total_npu):
     template = os.path.join(astra_sim, "extern/network_backend/ns-3/scratch/config/config.txt")
     output_dir = os.path.join(run_paths.inputs_root, "ns3", "output")
-    config_path = os.path.join(run_paths.inputs_root, "ns3", "config.txt")
+    ns3_dir = os.path.join(run_paths.inputs_root, "ns3")
+    config_path = os.path.join(ns3_dir, "config.txt")
+    logical_topology_path = os.path.join(ns3_dir, "logical_topology.json")
     os.makedirs(output_dir, exist_ok=True)
-    os.makedirs(os.path.dirname(config_path), exist_ok=True)
+
+    # The logical topology must match what the analytical backend derives from
+    # network.yml: same dimension count and same size per dimension. A flat
+    # [total_npu] topology would change which ranks a collective spans.
+    with open(run_paths.network_config, "r", encoding="utf-8") as f:
+        dims = yaml.safe_load(f)["npus_count"]
+    if not isinstance(dims, list):
+        dims = [dims]
+    dims = [int(d) for d in dims]
+    logical_npu = 1
+    for d in dims:
+        logical_npu *= d
+    if logical_npu != total_npu:
+        # The ns-3 backend builds one Sys per logical rank; a mismatch would
+        # leave ranks the frontend schedules for with no system to run on.
+        raise ValueError(
+            "ns3 logical topology %s has %d NPUs but the cluster has %d"
+            % (dims, logical_npu, total_npu))
+    with open(logical_topology_path, "w", encoding="utf-8") as f:
+        json.dump({"logical-dims": [str(d) for d in dims]}, f)
 
     replacements = {
+        "TOPOLOGY_FILE": _select_ns3_topology(astra_sim, total_npu),
         "FLOW_FILE": os.path.join(output_dir, "flow.txt"),
         "TRACE_FILE": os.path.join(output_dir, "trace.txt"),
         "TRACE_OUTPUT_FILE": os.path.join(output_dir, "mix.tr"),
@@ -169,7 +211,7 @@ def _prepare_ns3_config(astra_sim, run_paths):
                 f.write(f"{parts[0]} {replacements[parts[0]]}\n")
             else:
                 f.write(line)
-    return config_path
+    return config_path, logical_topology_path
 
 
 def _iter_raw_instances(cluster_config):
@@ -709,9 +751,10 @@ def main():
     # If you want to set more specific information such as latency, look at config.py and each json file
     if network_backend == 'analytical':
         network=run_paths.network_config
+        logical_topology=None
         binary=os.path.join(astra_sim, "build/astra_analytical/build/AnalyticalAstra/bin/AnalyticalAstra")
     elif network_backend == 'ns3':
-        network=_prepare_ns3_config(astra_sim, run_paths)
+        network, logical_topology = _prepare_ns3_config(astra_sim, run_paths, total_npu)
         binary=os.path.join(astra_sim, "extern/network_backend/ns-3/build/scratch/ns3.42-AstraSimNetwork-default")
     else:
         raise NotImplementedError("Only analytical and ns3 network backend are supported")
@@ -903,12 +946,16 @@ def main():
     workload = get_workload(None, None, event=True, inputs_root=run_paths.inputs_root)
     # run subprocess
     astra_args = [binary, "--workload-configuration="+workload, "--system-configuration="+system, "--network-configuration="+network, "--memory-configuration="+memory]
-    if start_npu_ids != "":
-        astra_args.append("--start-npu-ids="+start_npu_ids)
-    if end_npu_ids != "":
-        astra_args.append("--end-npu-ids="+end_npu_ids)
     if network_backend == 'ns3':
-        astra_args.append("--logical-topology-configuration="+astra_sim+"/inputs/logical_topology/logical_8nodes_1D.json")
+        # The ns-3 backend runs every rank in one process and registers no
+        # rank-range flags, so the analytical backend's per-instance filters
+        # must not be forwarded to it.
+        astra_args.append("--logical-topology-configuration="+logical_topology)
+    else:
+        if start_npu_ids != "":
+            astra_args.append("--start-npu-ids="+start_npu_ids)
+        if end_npu_ids != "":
+            astra_args.append("--end-npu-ids="+end_npu_ids)
     p = subprocess.Popen(astra_args, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
 
     # DP group synchronization: defer trace generation until all members have scheduled

@@ -3,13 +3,13 @@ USE_DYNAMIC_PFC_THRESHOLD 1
 
 PACKET_PAYLOAD_SIZE 1000
 
-TOPOLOGY_FILE extern/network_backend/ns-3/scratch/topology/8_nodes_1_switch_topology.txt
-FLOW_FILE extern/network_backend/ns-3/scratch/output/flow.txt
-TRACE_FILE extern/network_backend/ns-3/scratch/output/trace.txt
-TRACE_OUTPUT_FILE extern/network_backend/ns-3/scratch/output/mix.tr
-FCT_OUTPUT_FILE extern/network_backend/ns-3/scratch/output/fct.txt
-PFC_OUTPUT_FILE extern/network_backend/ns-3/scratch/output/pfc.txt
-QLEN_MON_FILE extern/network_backend/ns-3/scratch/output/qlen.txt
+TOPOLOGY_FILE ../../../ns-3/scratch/topology/8_nodes_1_switch_topology.txt
+FLOW_FILE ../../../ns-3/scratch/output/flow.txt
+TRACE_FILE ../../../ns-3/scratch/output/trace.txt
+TRACE_OUTPUT_FILE ../../../ns-3/scratch/output/mix.tr
+FCT_OUTPUT_FILE ../../../ns-3/scratch/output/fct.txt
+PFC_OUTPUT_FILE ../../../ns-3/scratch/output/pfc.txt
+QLEN_MON_FILE ../../../ns-3/scratch/output/qlen.txt
 QLEN_MON_START 0
 QLEN_MON_END 20000
 
