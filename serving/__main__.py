@@ -42,7 +42,7 @@ from pyinstrument import Profiler
 
 
 
-
+# 让batch计算量达到模型最低标准
 def _pad_batch_to_max(batch, max_len):
     """Pad model-forward rows without inventing requests or KV history.
 
@@ -149,6 +149,7 @@ def _select_ns3_topology(astra_sim, total_npu):
     """
     topology_dir = os.path.join(astra_sim, "extern/network_backend/ns-3/scratch/topology")
     candidates = (
+        (8, "8_nodes_2leaf_2spine_topology.txt"),
         (8, "8_nodes_1_switch_topology.txt"),
         (128, "128_nodes_32_switch_topology.txt"),
     )

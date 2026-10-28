@@ -315,6 +315,19 @@ def _sync_system_collective_dims(system_config_path, instances):
 
 
 # parse cluster configuration from JSON file and build config file for astra-sim
+# 输入：cluster_config.json（用户写的）    
+# ① 读取 + 校验 JSON
+#       ↓
+# ② 应用硬件默认值（link_bw、link_latency、npu_mem 等）
+#       ↓
+# ③ 解析每个节点（node）和实例（instance）
+#       ↓
+# ④ 生成 ASTRA-Sim 需要的三个配置文件：
+#    - network_config（网络拓扑）
+#    - system_config（系统参数）
+#    - memory_config（内存层级）
+#       ↓
+# ⑤ 构建并返回 cluster 字典（供调度器用）
 def build_cluster_config(astra_sim, cluster_config_path, enable_local_offloading=False, enable_attn_offloading=False, inputs_root=None):
     # Relative paths are read from the repo root, one level out of astra-sim,
     # which is the cwd by now. An absolute path is already complete --

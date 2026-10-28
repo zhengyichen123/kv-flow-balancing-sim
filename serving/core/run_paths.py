@@ -32,7 +32,9 @@ def resolve_run_id(run_id=None):
         )
     return run_id
 
-
+# ./astra-sim/inputs/runs/<run_id>/network/network.yml
+# ./astra-sim/inputs/runs/<run_id>/system/system.json
+# ./astra-sim/inputs/runs/<run_id>/memory/no_memory_expansion.json
 def build_run_paths(astra_sim, run_id, inputs_root=None):
     if inputs_root is None:
         inputs_root = os.path.join(astra_sim, "inputs", "runs", run_id)
