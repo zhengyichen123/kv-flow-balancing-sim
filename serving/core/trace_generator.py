@@ -122,6 +122,10 @@ class TraceCtx:
     dp_token_counts: tuple = ()  # Authoritative padded model rows in DP-rank order.
     component_sizes: object = None  # Explicit selected-runtime logical boundaries.
     duration_replay_only: bool = False  # Explicitly bypasses any serving/capacity support claim.
+    # instance id -> absolute NPU offset of that instance's first rank. The P/D
+    # KV column has to name its destination as a rank, not an instance, because
+    # that is all the converter and ASTRA-Sim below it understand.
+    inst2npu_mapping: dict = None
 
 
 @dataclass
@@ -1198,7 +1202,8 @@ def _build_trace_ctx(hardware, model, config, tp_size, pp_size, local_ep, ep_tot
                      variant, kv_cache_dtype='auto',
                      runtime_max_num_batched_tokens=None, runtime_max_num_seqs=None,
                      tp_dim=None, ep_dim=None, dp_sum_total_len=0, dp_min_total_len=0, num_speculative_tokens=0,
-                     dp_rank=0, dp_token_counts=(), duration_replay_only=False):
+                     dp_rank=0, dp_token_counts=(), duration_replay_only=False,
+                     inst2npu_mapping=None):
     if dp_rank < 0 or (gate is not None and (dp_rank + 1) * max(local_ep, 1) > ep_total):
         raise ValueError("DP member's local expert ranks exceed the EP group")
     model_type = config.get('model_type')
@@ -1245,6 +1250,7 @@ def _build_trace_ctx(hardware, model, config, tp_size, pp_size, local_ep, ep_tot
         num_speculative_tokens=num_speculative_tokens,
         component_sizes=_selected_component_sizes(perf_db, tp_size, config),
         duration_replay_only=duration_replay_only,
+        inst2npu_mapping=inst2npu_mapping,
     )
     if ctx.component_sizes is not None:
         from .component_sizes import validate_local_trace
@@ -1326,8 +1332,16 @@ def _layer_category(perf_db, layer_name):
 
 
 def _emit_layer(ctx, bctx, layer_name, lines, power_acc, batch_tag='NONE', layer_num=None,
-                comm_type='NONE', comm_size=0, input_loc='LOCAL', output_loc='LOCAL', source_role=None):
-    """Emit a single trace layer: lookup latency, compute sizes, format, track power."""
+                comm_type='NONE', comm_size=0, input_loc='LOCAL', output_loc='LOCAL', source_role=None,
+                kv_peers=None):
+    """Emit a single trace layer: lookup latency, compute sizes, format, track power.
+
+    ``kv_peers`` is the P/D split of this layer's KV, ``{peer_npu_offset: bytes}``.
+    It goes into a trailing column rather than replacing ``comm_size`` so that
+    ``comm_size`` keeps its existing meaning (the layer's collective, or the
+    total for power accounting) and every reader that predates the split keeps
+    working. An unset split writes ``-``.
+    """
     category = _layer_category(ctx.perf_db, layer_name)
     if category is None:
         raise KeyError(
@@ -1400,13 +1414,22 @@ def _emit_layer(ctx, bctx, layer_name, lines, power_acc, batch_tag='NONE', layer
 
     wt_loc = get_device(ctx.placement, layer_num, layer_name, "weights")
 
+    peers_col = ','.join(f"{peer}:{nbytes}" for peer, nbytes in sorted((kv_peers or {}).items())) or '-'
+
     lines.append((layer_name, str(latency_ns), input_loc, str(inp), wt_loc,
-                  str(wt), output_loc, str(out), comm_type, str(comm_size), batch_tag))
+                  str(wt), output_loc, str(out), comm_type, str(comm_size), batch_tag,
+                  peers_col))
 
     if power_acc is not None:
         power_acc.npu_latencies_ns.append(latency_ns)
         if wt_loc != 'LOCAL':
             power_acc.dram_weight_bytes += wt
+        # The P/D KV moved out of ``comm_size`` and into its own column, so this
+        # is where its link traffic is counted now. One entry per peer, each
+        # crossing the link once -- point-to-point, no ring amplification.
+        p2p_bytes = sum((kv_peers or {}).values())
+        if p2p_bytes:
+            power_acc.link_data_bytes += p2p_bytes
         if comm_size > 0:
             collective = comm_type.split(':', 1)[0].lower()
             if collective == 'none':
@@ -1445,19 +1468,44 @@ def _shared_tp_collective(ctx, bctx, name):
     return 'NONE', 0
 
 
-def _pd_kv_send_bytes(ctx, bctx):
-    """Per-layer, per-rank KV bytes a prefill instance ships to its decode peer.
+def _pd_kv_peers(ctx, bctx):
+    """Per-layer, per-rank KV bytes, split by the peer that carries them.
 
-    ``batch.pd_kv_send_tokens`` counts this iteration's computed tokens plus, on a
-    request's first step, its prefix-cache hit: the decode side needs that KV even
-    though the prefill side read it from cache instead of computing it. Using the
-    trace's ``total_len`` instead would silently drop exactly the hit.
+    Returns ``{peer_npu_offset: bytes}``. The split is what the Chakra converter
+    needs: one layer can only become one send/recv node per peer, and a batch
+    may mix requests bound for different decode instances, so the byte counts
+    have to stay separable all the way from here to the graph.
+
+    The peer is addressed by the *instance's first NPU*, not by instance id,
+    because the converter---and ASTRA-Sim below it---only knows ranks. Each rank
+    of this instance talks to the same-indexed rank of the peer, so the
+    converter adds its own local index back on.
+
+    ``pd_kv_send_tokens`` counts this iteration's computed tokens plus, on a
+    request's first step, its prefix-cache hit: the decode side needs that KV
+    even though the prefill side read it from cache instead of computing it.
+    Using the trace's ``total_len`` instead would silently drop exactly the hit.
+    ``pd_kv_recv_tokens`` is the mirror image on the decode side, charged on the
+    step that has to wait for the stream.
     """
-    tokens = getattr(bctx.batch, 'pd_kv_send_tokens', 0) or 0
-    if tokens <= 0:
-        return 0
+    if ctx.pd_type == 'prefill':
+        tokens_by_peer = getattr(bctx.batch, 'pd_kv_send_tokens', None) or {}
+    elif ctx.pd_type == 'decode':
+        tokens_by_peer = getattr(bctx.batch, 'pd_kv_recv_tokens', None) or {}
+    else:
+        return {}
+    if not tokens_by_peer:
+        return {}
+    mapping = ctx.inst2npu_mapping or {}
     kv_dim = ctx.kv_head * ctx.head_dim
-    return 2 * kv_dim * tokens * ctx.kv_fp // max(ctx.tp_size, 1)
+    per_token = 2 * kv_dim * ctx.kv_fp // max(ctx.tp_size, 1)
+    peers = {}
+    for instance_id, tokens in tokens_by_peer.items():
+        offset = mapping.get(instance_id)
+        if offset is None or tokens <= 0:
+            continue
+        peers[offset] = peers.get(offset, 0) + per_token * tokens
+    return peers
 
 
 def _tp_comm(ctx, layer_name, total_len, collective='ALLREDUCE'):
@@ -1500,7 +1548,7 @@ def _emit_pim_attention(ctx, bctx, lines, power_acc, layer_num, batch_tag='NONE'
                 f'REMOTE:{ctx.node_id}.{ch}', str(inp),
                 get_device(ctx.placement, layer_num, "attention", "weights"), '0',
                 f'REMOTE:{ctx.node_id}.{ch}', str(out),
-                'NONE', '0', batch_tag))
+                'NONE', '0', batch_tag, '-'))
             if power_acc is not None and pim_lat > 0:
                 power_acc.pim_latencies_ns.append(pim_lat)
                 power_acc.dram_weight_bytes += inp + out
@@ -1702,7 +1750,7 @@ def _emit_moe_block(ctx, bctx, lines, power_acc, layer_num, batch_id_str, batch_
             max_rank_latency_ns = max(max_rank_latency_ns, rank_latency_ns)
 
             lines.append(("expert", str(rank_latency_ns), 'LOCAL', str(rank_inp),
-                wt_loc, str(rank_wt), 'LOCAL', str(rank_out), 'NONE', '0', batch_tag))
+                wt_loc, str(rank_wt), 'LOCAL', str(rank_out), 'NONE', '0', batch_tag, '-'))
 
             if power_acc is not None and wt_loc != 'LOCAL':
                 power_acc.dram_weight_bytes += rank_wt
@@ -2008,21 +2056,21 @@ def _emit_resolved_sequence(ctx, bctx, layer_num, layers, lines, power_acc, batc
             comm_size, comm_type = _tp_comm(ctx, layer_name, bctx.total_len)
             _emit_layer(ctx, bctx, layer_name, lines, power_acc, batch_tag, layer_num,
                         comm_type=_with_dim(comm_type, ctx.tp_dim), comm_size=comm_size)
-        elif layer_name == 'qkv_proj' and ctx.pd_type == 'prefill':
-            # P/D disaggregation: this layer's KV has to reach the paired decode
-            # instance. The Chakra converter's PREFILL path emits a point-to-point
-            # send after every *v_proj layer and takes the byte count from the
-            # trace's comm_size column, so put the KV size there.
+        elif layer_name == 'qkv_proj' and ctx.pd_type in ('prefill', 'decode'):
+            # P/D disaggregation: this layer's KV has to cross to the other
+            # instance. Which instance that is -- and how many bytes -- comes
+            # from the batch, split per peer, and lands in the trace's own
+            # ``kv_peers`` column rather than ``comm_size``: one batch can mix
+            # requests bound for different decode instances, and a Chakra send
+            # node carries exactly one destination. ``comm_size`` keeps its
+            # collective meaning; the converter reads the split from the extra
+            # column.
             #
-            # Deliberately not the layer's output_size, which the converter used
-            # to read: that is the whole QKV activation, so it shipped Q as well
-            # and overstated the transfer by (q_dim + 2*kv_dim) / (2*kv_dim) --
-            # 3x for Llama-3.1-8B, 1.5x for MHA, more at wider GQA ratios -- and
-            # it ignored kv_cache_dtype. comm_type stays NONE: the converter
-            # builds a SEND/RECV pair, for which ASTRA-Sim reads comm_size,
-            # comm_src, comm_dst and comm_tag.
+            # Both directions are emitted here because the converter needs a
+            # matching SEND (prefill) and RECV (decode) per layer, and the tag
+            # that pairs them is derived from the peer and layer index.
             _emit_layer(ctx, bctx, layer_name, lines, power_acc, batch_tag, layer_num,
-                        comm_size=_pd_kv_send_bytes(ctx, bctx))
+                        kv_peers=_pd_kv_peers(ctx, bctx))
         else:
             _emit_layer(ctx, bctx, layer_name, lines, power_acc, batch_tag, layer_num)
 
@@ -2321,16 +2369,20 @@ def _emit_final_layers(ctx, bctx, rows, batch_tag='NONE'):
 
 
 def _emit_pp_pd_power(ctx, bctx):
-    """Emit pipeline parallelism and P/D sync power."""
+    """Emit pipeline parallelism power.
+
+    The P/D KV link traffic is no longer estimated here. It moved into the
+    trace's own ``kv_peers`` column, which ``_emit_layer`` charges per layer
+    and per peer, so charging ``total_len * hidden`` here as well would bill
+    the same bytes twice. The trailing output send to the decode instance is
+    gone with it -- the decode side now pulls the KV itself and samples its
+    own tokens -- so there is no output-sized link transfer left to charge.
+    """
     if ctx.power_model is None:
         return
     if ctx.pp_size > 1:
         pp_comm = bctx.total_len * ctx.config['hidden_size'] * (ctx.pp_size - 1)
         ctx.power_model.add_link_energy_consumption(ctx.node_id, pp_comm)
-    if ctx.pd_type == 'prefill':
-        kv_comm = bctx.total_len * ctx.config['hidden_size'] * ctx.fp
-        out_size = bctx.lm_head_len * ctx.config['hidden_size'] * ctx.fp
-        ctx.power_model.add_link_energy_consumption(ctx.node_id, kv_comm + out_size)
 
 
 # ======================================================================
@@ -2366,13 +2418,50 @@ def _emit_prologue(ctx, bctx, rows, batch_tag='NONE'):
     return len(rows) - before
 
 
+def _coalesce_pd_kv_sends(rows, pd_type):
+    """Collapse a batch's per-layer P/D KV rows into one request-level send.
+
+    Every layer's ``qkv_proj`` row carries the *same* KV byte count, so the
+    trace as emitted describes N equal sends (N = stack depth) where a
+    disaggregated engine makes one prefill->decode transfer carrying the whole
+    prompt's KV. That is the granularity the routing study needs: a mega
+    elephant flow is one transfer, and splitting it into N small ones lets
+    ECMP average the imbalance away almost by accident.
+
+    Keep one row, scale it by the number of rows that carried KV, and blank
+    the others, so the converter below emits exactly one SEND/RECV pair per
+    peer -- one flow per request. Which row survives sets the timing: prefill
+    keeps the last (the transfer starts once the stack has finished
+    computing), decode keeps the first (the decode rank must hold the whole KV
+    before its first layer runs).
+
+    Power accounting is untouched -- it was already summed per layer while the
+    rows were emitted, before this rewrite.
+    """
+    kv_col = 11
+    carriers = [i for i, r in enumerate(rows)
+                if len(r) > kv_col and r[kv_col] not in ('-', '')]
+    if len(carriers) <= 1:
+        return
+    keep = carriers[-1] if pd_type == 'prefill' else carriers[0]
+    scaled = ','.join(
+        f"{peer}:{int(nbytes) * len(carriers)}"
+        for peer, nbytes in (pair.split(':') for pair in rows[keep][kv_col].split(','))
+    )
+    rows[keep] = rows[keep][:kv_col] + (scaled,) + rows[keep][kv_col + 1:]
+    for i in carriers:
+        if i != keep:
+            rows[i] = rows[i][:kv_col] + ('-',) + rows[i][kv_col + 1:]
+
+
 def _synthesize_trace(hardware, model, config, tp_size, pp_size, local_ep, ep_total, pd_type, node_id, instance_id,
                       batch, max_len, placement, block_mode_on, gate,
                       enable_attn_offloading, power_model, pim_model, fp,
                       variant, kv_cache_dtype='auto',
                       runtime_max_num_batched_tokens=None, runtime_max_num_seqs=None,
                       tp_dim=None, ep_dim=None, dp_sum_total_len=0, dp_min_total_len=0,
-                      num_speculative_tokens=0, dp_rank=0, dp_token_counts=(), duration_replay_only=False):
+                      num_speculative_tokens=0, dp_rank=0, dp_token_counts=(), duration_replay_only=False,
+                      inst2npu_mapping=None):
     ctx = _build_trace_ctx(hardware, model, config, tp_size, pp_size, local_ep, ep_total, node_id, fp,
                            placement, gate, enable_attn_offloading, power_model, pim_model, pd_type,
                            variant=variant, kv_cache_dtype=kv_cache_dtype,
@@ -2382,7 +2471,8 @@ def _synthesize_trace(hardware, model, config, tp_size, pp_size, local_ep, ep_to
                            dp_min_total_len=dp_min_total_len,
                            num_speculative_tokens=num_speculative_tokens, dp_rank=dp_rank,
                            dp_token_counts=dp_token_counts,
-                           duration_replay_only=duration_replay_only)
+                           duration_replay_only=duration_replay_only,
+                           inst2npu_mapping=inst2npu_mapping)
     bctx = _build_batch_ctx(batch, ctx)
 
     if ctx.component_sizes is not None:
@@ -2458,6 +2548,8 @@ def _synthesize_trace(hardware, model, config, tp_size, pp_size, local_ep, ep_to
     _emit_drafter(ctx, bctx, rows, str(batch.batch_id))
     _emit_pp_pd_power(ctx, bctx)
 
+    # One prefill->decode KV transfer per request, not one per layer.
+    _coalesce_pd_kv_sends(rows, pd_type)
 
     return rows, block_starts
 
@@ -2472,7 +2564,8 @@ def _synthesize_interleaved_trace(hardware, model, config, tp_size, pp_size, loc
                                   variant, kv_cache_dtype='auto',
                                   runtime_max_num_batched_tokens=None, runtime_max_num_seqs=None,
                                   tp_dim=None, ep_dim=None, dp_sum_total_len=0, dp_min_total_len=0,
-                                  num_speculative_tokens=0, dp_rank=0, dp_token_counts=(), duration_replay_only=False):
+                                  num_speculative_tokens=0, dp_rank=0, dp_token_counts=(), duration_replay_only=False,
+                                  inst2npu_mapping=None):
     ctx = _build_trace_ctx(hardware, model, config, tp_size, pp_size, local_ep, ep_total, node_id, fp,
                            placement, gate, enable_attn_offloading, power_model, pim_model, pd_type,
                            variant=variant, kv_cache_dtype=kv_cache_dtype,
@@ -2482,7 +2575,8 @@ def _synthesize_interleaved_trace(hardware, model, config, tp_size, pp_size, loc
                            dp_min_total_len=dp_min_total_len,
                            num_speculative_tokens=num_speculative_tokens, dp_rank=dp_rank,
                            dp_token_counts=dp_token_counts,
-                           duration_replay_only=duration_replay_only)
+                           duration_replay_only=duration_replay_only,
+                           inst2npu_mapping=inst2npu_mapping)
     if ctx.component_sizes is not None:
         raise NotImplementedError('Native DSA interleaved trace execution is not yet admitted')
     bctx1 = _build_batch_ctx(batches[0], ctx)
@@ -2628,6 +2722,7 @@ def generate_trace(batch, hardware, tp_size, pp_size, local_ep, ep_total, pd_typ
                    enable_sub_batch_interleaving=False, fp=16, dtype=None, kv_cache_dtype='auto',
                    tp_dim=None, ep_dim=None, dp_sum_total_len=0, dp_min_total_len=0, enable_block_copy=True, inputs_root=None,
                    num_speculative_tokens=0, gate_stats_path=None, dp_rank=0, dp_token_counts=(),
+                   inst2npu_mapping=None,
                    *, duration_replay_only=False):
 
     if type(duration_replay_only) is not bool:
@@ -2699,7 +2794,8 @@ def generate_trace(batch, hardware, tp_size, pp_size, local_ep, ep_total, pd_typ
                         dp_min_total_len=dp_min_total_len,
                         num_speculative_tokens=num_speculative_tokens, dp_rank=dp_rank,
                         dp_token_counts=tuple(dp_token_counts),
-                        duration_replay_only=duration_replay_only)
+                        duration_replay_only=duration_replay_only,
+                        inst2npu_mapping=inst2npu_mapping)
     if not enable_sub_batch_interleaving:
         rows, block_starts = _synthesize_trace(*synth_args, batch, max_len, **synth_kwargs)
     else:
@@ -2720,12 +2816,12 @@ def generate_trace(batch, hardware, tp_size, pp_size, local_ep, ep_total, pd_typ
     # vllm: prepend the load / evict rows
     mem = []
     if load_size != 0:
-        load = ["kv_load", '0', 'LOCAL', '0', get_device(placement, None, None, 'kv_evict_loc'), str(load_size), 'LOCAL', '0', 'NONE', '0', 'NONE']
+        load = ["kv_load", '0', 'LOCAL', '0', get_device(placement, None, None, 'kv_evict_loc'), str(load_size), 'LOCAL', '0', 'NONE', '0', 'NONE', '-']
         mem.append(load)
         if power_model is not None:
             power_model.add_dram_energy_consumption(node_id, load_size)
     if evict_size != 0:
-        evict = ["kv_evict", '0', 'LOCAL', '0', get_device(placement, None, None, 'kv_evict_loc'), str(evict_size), 'LOCAL', '0', 'NONE', '0', 'NONE']
+        evict = ["kv_evict", '0', 'LOCAL', '0', get_device(placement, None, None, 'kv_evict_loc'), str(evict_size), 'LOCAL', '0', 'NONE', '0', 'NONE', '-']
         mem.append(evict)
         if power_model is not None:
             power_model.add_dram_energy_consumption(node_id, evict_size)
@@ -2767,7 +2863,7 @@ def generate_trace(batch, hardware, tp_size, pp_size, local_ep, ep_total, pd_typ
 class TraceData:
     """A synthesized trace, before it is turned into text.
 
-    ``rows`` are field tuples straight from the emitters: eleven fields for a
+    ``rows`` are field tuples straight from the emitters: twelve fields for a
     layer, one for an EXPERT/PIM marker. ``path`` is where the ``.txt`` goes
     if anything asks for it.
     """
@@ -2777,7 +2873,7 @@ class TraceData:
     byte_contract: str = None
 
 
-_TRACE_ROW_FIELDS = 11
+_TRACE_ROW_FIELDS = 12
 
 # One-shot guard, see _write_trace.
 _row_format_checked = False
@@ -2787,7 +2883,7 @@ def indexed_cols(rows):
     """The field lists the Chakra converter sees after parsing the trace text.
 
     Mirrors _write_trace's two cases. A layer row gets its final row index
-    appended to the name and keeps its ten other fields. A marker row becomes
+    appended to the name and keeps its eleven other fields. A marker row becomes
     the tokens of its text -- which is how it comes back today, once the
     formatter has padded it into the name column and the reader has split the
     line on whitespace.
@@ -2826,7 +2922,7 @@ def write_trace(trace):
 def _write_trace(output_path, header_line, rows):
     """Write the trace file in a single pass.
 
-    Rows arrive as field tuples straight from the emitters: eleven fields
+    Rows arrive as field tuples straight from the emitters: twelve fields
     for a layer, one for an ``EXPERT``/``PIM`` marker whose text occupies
     the name column with the rest blank. Layer names get their final row
     index appended here, and here only, because that index depends on how
@@ -2912,7 +3008,7 @@ def generate_event(alarm, inputs_root=None):
     if inputs_root is None:
         inputs_root = os.path.join(os.getcwd(), "inputs")
     row = (f'event_{alarm}ns', str(alarm), 'REMOTE', '0', 'LOCAL', '0',
-           'REMOTE', '0', 'NONE', '0', 'NONE')
+           'REMOTE', '0', 'NONE', '0', 'NONE', '-')
     return TraceData(
         header_line="EVENT",
         rows=[row],

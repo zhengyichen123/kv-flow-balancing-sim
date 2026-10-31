@@ -19,6 +19,18 @@ class MemoryType(Enum):
     STORAGE_MEMORY = 4
 
 
+# P/D disaggregation: a layer's KV SEND is written into the prefill instance's
+# graph and the matching RECV into the decode instance's graph, but the two
+# graphs come from *separate* converter instances -- prefill and decode are
+# converted independently, each numbering its comm tags from zero. So
+# ``get_next_comm_tag`` cannot pair them: rank 0's first KV send would be tag 0
+# while the decode rank's first KV recv might be tag 0 for a different layer, or
+# 0 for layer 3 after some other message took 0. KV tags are therefore a pure
+# function of the hop's position in the KV layer sequence, over a base high
+# enough that the automatic counter never reaches it.
+KV_TAG_BASE = 1 << 20
+
+
 class Layer:
     def __init__(self, line: str = None, cols: List[str] = None):
         try:
@@ -52,6 +64,7 @@ class Layer:
                     self.comm_size = 0
                 self.is_expert = True
                 self.is_pim = False
+                self.kv_peers = {}
                 self.comm_node = None
                 self.comp_node = None
             elif col[0] == 'PIM': # If PIM Flag
@@ -59,6 +72,7 @@ class Layer:
                 self.pim_num = col[1]
                 self.is_expert = False
                 self.is_pim = True
+                self.kv_peers = {}
                 self.comm_node = None
                 self.comp_node = None
                 self.comm_type = "NONE"
@@ -89,6 +103,22 @@ class Layer:
                 self.comm_node = None
 
                 self.misc = str(col[10])
+
+                # P/D disaggregation: this layer's KV split by destination,
+                # ``{peer_npu_offset: bytes}``, encoded as "peerN:bytes,..."
+                # or "-" when the layer ships no KV. It is a column of its
+                # own rather than part of ``comm_size`` because one batch can
+                # mix requests bound for different decode instances while a
+                # send node carries exactly one ``comm_dst``, so the split has
+                # to survive the trip from the scheduler to the graph.
+                # Trailing column, so an older 11-column trace simply has no
+                # split and converts as it did before.
+                self.kv_peers = {}
+                if len(col) > 11 and col[11] != '-':
+                    for part in col[11].split(','):
+                        peer, nbytes = part.split(':')
+                        if int(nbytes) > 0:
+                            self.kv_peers[int(peer)] = int(nbytes)
         except:
             raise ValueError(f"Cannot parse the following layer -- \"{line}\"")
 
@@ -254,7 +284,8 @@ class LLMConverter:
         return node
 
     def get_comm_node(self, is_send: bool, layer_name: str, comm_type: str, comm_size: int,
-                           comm_src: int, comm_dst: int, id: int = 0) -> Any:
+                           comm_src: int, comm_dst: int, id: int = 0,
+                           tag: int = None) -> Any:
         if is_send:
             node = self.get_node(
                     f"COMM_SEND_NODE_{layer_name}_{comm_type}_{comm_src}_{comm_dst}",
@@ -267,6 +298,13 @@ class LLMConverter:
         node.attr.append(ChakraAttr(name="comm_src", int32_val=comm_src))
         node.attr.append(ChakraAttr(name="comm_dst", int32_val=comm_dst))
         node.attr.append(ChakraAttr(name="comm_size", int64_val=comm_size))
+        if tag is not None:
+            # Caller owns the tag. The P/D KV hops need this: their SEND and
+            # RECV live in graphs produced by different converter instances,
+            # so no per-instance counter can pair them. See KV_TAG_BASE.
+            node.attr.append(ChakraAttr(name="comm_tag", int32_val=tag))
+            return node
+
         comm_key = f"{comm_src}_{comm_dst}_{id}"
         if comm_key in self.comm_tag_dict:
             node.attr.append(ChakraAttr(name="comm_tag", int32_val=self.comm_tag_dict[comm_key]))
@@ -446,8 +484,14 @@ class LLMConverter:
                 # rebind layer_end if it ever overruns.
                 layer_start, layer_end = stage_edges[npu_group]
                 npu_id = npu_group * npus_per_group + npu_offset + self.npu_offset
+                # Rank of this NPU *inside its own instance*, for the same reason
+                # as in convert_prefill: the P/D KV hops name the peer instance
+                # by its first NPU and add the local index back on.
+                local_rank = npu_group * npus_per_group + npu_offset
                 output_filename = "%s.%d.et" % (self.output_filename, npu_id)
                 first_comp_node = True
+                # KV layers seen so far on this rank; see convert_prefill.
+                kv_seq = 0
                 with open(output_filename, "wb") as g:
                     global_metadata = self.get_global_metadata()
                     encode_message(g, global_metadata)
@@ -562,6 +606,37 @@ class LLMConverter:
                                         past_pim_comp_nodes = pim_comp_nodes # update past pim comp nodes
                                         pim_comp_nodes = [] # reset pim comp nodes
                                         last_batch_type = layers[layer_num].misc
+
+                                # Receive this layer's KV before the layer runs.
+                                #
+                                # Under P/D disaggregation the decode instance
+                                # owns no KV for the prompt: it arrives from the
+                                # prefill instance, one hop per source. The trace
+                                # says which, and how many bytes, in its
+                                # ``kv_peers`` column. Hanging the RECV under the
+                                # compute node is what makes the decode rank
+                                # actually wait for the stream instead of
+                                # starting its layer on KV it does not have yet.
+                                #
+                                # Colocated traces leave ``kv_peers`` empty, so
+                                # this is a no-op there.
+                                if layers[layer_num].kv_peers:
+                                    for peer_offset, kv_bytes in sorted(
+                                            layers[layer_num].kv_peers.items()):
+                                        recv_kv_node = self.get_comm_node(
+                                            is_send=False,
+                                            layer_name="kv_proj",
+                                            comm_type=layers[layer_num].comm_type,
+                                            comm_size=kv_bytes,
+                                            # Mirror of the send: the prefill
+                                            # rank that owns shard i of the KV.
+                                            comm_src=peer_offset + local_rank,
+                                            comm_dst=npu_id,
+                                            id=layer_num,
+                                            tag=KV_TAG_BASE + kv_seq)
+                                        encode_message(g, recv_kv_node)
+                                        self.add_parent(comp_node, recv_kv_node)
+                                    kv_seq += 1
 
                                 encode_message(g, comp_node)
 
@@ -782,13 +857,21 @@ class LLMConverter:
                 # rebind layer_end if it ever overruns.
                 layer_start, layer_end = stage_edges[npu_group]
                 npu_id = npu_group * npus_per_group + npu_offset + self.npu_offset
+                # Rank of this NPU *inside its own instance*. The P/D KV hops
+                # address the peer instance by its first NPU, so the local part
+                # of the address is this and only this.
+                local_rank = npu_group * npus_per_group + npu_offset
                 output_filename1 = "%s.%d.et" % (self.output_filename, npu_id)
-                output_filename2 = "%s.%d.et" % (self.output_filename, npu_id + self.num_npus) # sender for prefill-decode
                 first_comp_node = True
-                with open(output_filename1, "wb") as g, open(output_filename2, "wb") as s:
+                # Position of this layer in the KV-carrying sequence; the tag of
+                # the matching send/recv pair is derived from it. Counted from
+                # the first KV layer of this rank rather than from the trace row
+                # index because the two sides may prepend a different number of
+                # kv_load / kv_evict rows.
+                kv_seq = 0
+                with open(output_filename1, "wb") as g:
                     global_metadata = self.get_global_metadata()
                     encode_message(g, global_metadata)
-                    encode_message(s, global_metadata)
                     if evict != None:
                         encode_message(g, evict)
                     if load != None:
@@ -874,38 +957,46 @@ class LLMConverter:
                                 
                                 encode_message(g, comp_node)
 
-                                # Send KV cache after each kv_proj.
-                                # comm_size comes from the trace's comm_size
+                                # Send KV cache after each kv_proj, one hop per
+                                # destination.
+                                #
+                                # The bytes come from the trace's ``kv_peers``
                                 # column, which the frontend fills with the
-                                # per-layer, per-rank K+V bytes. It used to read
-                                # output_memory_size, i.e. the whole QKV
-                                # activation, which shipped Q as well and
+                                # per-layer KV split by destination instance.
+                                # They used to come from ``comm_size`` alone,
+                                # which forced a single destination per layer --
+                                # and that destination was the shadow npu
+                                # ``npu_id + num_npus``, i.e. the paired rank
+                                # inside the *same* prefill instance, so the
+                                # decode instance received nothing on this path
+                                # at all.
+                                #
+                                # ``comm_size`` was also not the right quantity:
+                                # it is the layer's collective size, and the read
+                                # before this one was output_memory_size, i.e.
+                                # the whole QKV activation -- it shipped Q too and
                                 # overstated the transfer by
-                                # (q_dim + 2*kv_dim) / (2*kv_dim) -- 3x for
-                                # Llama-3.1-8B -- and ignored kv_cache_dtype.
-                                if "v_proj" in layers[layer_num].name and layers[layer_num].comm_size > 0:
-                                    send_kv_node = self.get_comm_node(
-                                        is_send=True,
-                                        layer_name="kv_proj",
-                                        comm_type=layers[layer_num].comm_type,
-                                        comm_size=layers[layer_num].comm_size,
-                                        comm_src=npu_id,
-                                        comm_dst=npu_id + self.num_npus, # to the paired npu in decode
-                                        id=layer_num
-                                    )
-                                    self.add_parent(send_kv_node, comp_node)
-                                    encode_message(g, send_kv_node)
-
-                                    recv_kv_node = self.get_comm_node(
-                                        is_send=False,
-                                        layer_name="kv_proj",
-                                        comm_type=layers[layer_num].comm_type,
-                                        comm_size=layers[layer_num].comm_size,
-                                        comm_src=npu_id,
-                                        comm_dst=npu_id + self.num_npus,
-                                        id=layer_num
-                                    )
-                                    encode_message(s, recv_kv_node)
+                                # (q_dim + 2*kv_dim) / (2*kv_dim), 3x for
+                                # Llama-3.1-8B, and ignored kv_cache_dtype.
+                                if "v_proj" in layers[layer_num].name and layers[layer_num].kv_peers:
+                                    for peer_offset, kv_bytes in sorted(
+                                            layers[layer_num].kv_peers.items()):
+                                        send_kv_node = self.get_comm_node(
+                                            is_send=True,
+                                            layer_name="kv_proj",
+                                            comm_type=layers[layer_num].comm_type,
+                                            comm_size=kv_bytes,
+                                            comm_src=npu_id,
+                                            # Peer instance's first npu + this
+                                            # rank's index inside its own
+                                            # instance: shard i of the KV goes
+                                            # to shard i of the decode tp group.
+                                            comm_dst=peer_offset + local_rank,
+                                            id=layer_num,
+                                            tag=KV_TAG_BASE + kv_seq)
+                                        self.add_parent(send_kv_node, comp_node)
+                                        encode_message(g, send_kv_node)
+                                    kv_seq += 1
 
                             # Communication (if required)
                             if layers[layer_num].comm_type != "NONE" and use_comm:
@@ -956,34 +1047,15 @@ class LLMConverter:
                               f"layer {layer_num}, expected {layer_end}")
                         layer_end = layer_num
 
-                    if npu_group == (num_npu_group - 1):
-                        # Send output (for the last layer, to the paired decode npu)
-                        send_output_node = self.get_comm_node(
-                            is_send=True,
-                            layer_name=layers[layer_end - 1].name,
-                            comm_type=layers[layer_end - 1].comm_type,
-                            comm_size=layers[layer_end - 1].output_memory_size,
-                            comm_src=npu_id,
-                            comm_dst=npu_id + self.num_npus
-                        )
-                        if layers[layer_end - 1].comm_type != "NONE" and use_comm:
-                            self.add_parent(send_output_node, comm_coll_node)
-                        elif layers[layer_end - 1].comp_node != None:
-                            self.add_parent(send_output_node, comp_node)
-                        else:
-                            self.add_parent(send_output_node, layers[layer_end - 2].comp_node)
-                        encode_message(g, send_output_node)
-                        # paired decode npu receive output
-                        recv_output_node = self.get_comm_node(
-                            is_send=False,
-                            layer_name=layers[layer_end - 1].name,
-                            comm_type=layers[layer_end - 1].comm_type,
-                            comm_size=layers[layer_end - 1].output_memory_size,
-                            comm_src=npu_id,
-                            comm_dst=npu_id + self.num_npus
-                        )
-                        encode_message(s, recv_output_node)
-                    else:
+                    # The last npu group has nothing to send out. It used to ship
+                    # its final activation to ``npu_id + num_npus``, a shadow rank
+                    # that existed only to feed the paired decoder's graph. With
+                    # the per-layer KV sends above, that graph is fed layer by
+                    # layer instead, so the hop had no remaining consumer -- and
+                    # the decode graph never actually read it: a DECODE graph
+                    # with one pipeline group starts from a local
+                    # ``input_load_node``, not from a RECV.
+                    if npu_group != (num_npu_group - 1):
                         if layers[layer_end - 1].is_expert:
                             # Send output (to the next layer in another npu group)
                             send_output_node = self.get_comm_node(

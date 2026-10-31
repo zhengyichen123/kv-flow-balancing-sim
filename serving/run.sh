@@ -7,11 +7,23 @@
 # against recorded results) use ./serving/validate.sh.
 
 # Single instance. Prefix caching in xPU memory is on by default.
-python -m serving --cluster-config 'configs/cluster/single_node_single_instance.json' \
-    --block-size 16 \
-    --dataset 'workloads/example_trace.jsonl' --output 'outputs/example_single_run.csv' \
-    --num-reqs 10
+# python -m serving --cluster-config 'configs/cluster/single_node_single_instance.json' \
+#     --block-size 16 \
+#     --dataset 'workloads/example_trace.jsonl' --output 'outputs/example_single_run.csv' \
+#     --num-reqs 10
 
+for sps in 30 20 10 5; do
+  n=$((sps * 10))
+  python -m serving \
+    --cluster-config configs/cluster/dual_node_8p8d.json \
+    --network-backend ns3 \
+    --dataset workloads/kv_poisson_sps${sps}.jsonl --num-reqs ${n} \
+    --max-num-batched-tokens 65536 \
+    --request-routing-policy RAND --pd-pairing dynamic \
+    --log-interval 1.0 \
+    --keep-inputs --run-id pd_ecmp_rand_sps${sps} \
+    --output outputs/pd_ecmp_rand_sps${sps}.csv
+done
 # Multiple instances on one node, requests routed across them
 # python -m serving --cluster-config 'configs/cluster/single_node_multi_instance.json' \
 #     --block-size 16 \

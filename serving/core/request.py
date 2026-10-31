@@ -24,6 +24,25 @@ class Request:
         self.output = output
         self.arrival = arrival
         self.instance_id = instance_id
+        # P/D disaggregation: the decode peer is picked when the request arrives
+        # (mirroring NIXL's push registration, where the decode instance has its
+        # buffers ready before prefill finishes). The prefill side keeps its own
+        # instance_id; add_decode builds a separate copy for the decode instance
+        # rather than relabelling this object, which still has to run prefill
+        # and be reported against the instance it actually ran on.
+        self.prefill_instance_id = instance_id
+        self.decode_instance_id = None
+        # Decode side only: KV tokens the prefill instance still owes this
+        # request, consumed by the first batch that schedules it. It is a token
+        # count rather than a byte count because the per-layer byte size needs
+        # the model shape, which only the trace generator has.
+        self.pd_kv_pending_tokens = 0
+        # Prefill side only: set once this request's prefix-cache hit has been
+        # added to the KV it sends its decode instance. The hit is owed exactly
+        # once, on the request's *first* admission -- a preempted request later
+        # recomputes from blocks whose KV already went out, so a re-admission
+        # must not add the hit a second time. Never reset by preemption.
+        self.pd_kv_hit_sent = False
         self.is_init = is_init
         self.original_input = input
         self.num_computed_tokens = 0  # Tracks actual computed tokens (vLLM style)
@@ -135,7 +154,7 @@ class Request:
 
 # class that manages batch of astra-sim
 class Batch:
-    def __init__(self, batch_id, model, total_len, kv_len, q_list, k_list, num_prefill, num_decode, prefill_q_list, prefill_k_list, decode_k_list, batch_time, kv_size, evict=0, load=0, pd_kv_send_tokens=0, decode_q_len=1):
+    def __init__(self, batch_id, model, total_len, kv_len, q_list, k_list, num_prefill, num_decode, prefill_q_list, prefill_k_list, decode_k_list, batch_time, kv_size, evict=0, load=0, pd_kv_send_tokens=None, decode_q_len=1, pd_kv_recv_tokens=None):
         self.batch_id = batch_id
         self.model = model
         self.total_len = total_len
@@ -148,11 +167,17 @@ class Batch:
         self.kv_size = kv_size
         self.evict = evict
         self.load = load
-        # P/D disaggregation: tokens whose KV this batch must ship to the paired
-        # decode instance. Counts prefix-cache hits on a request's first step,
-        # because the decode side needs that KV even though the prefill side did
-        # not compute it. 0 unless pd_type == "prefill".
-        self.pd_kv_send_tokens = pd_kv_send_tokens
+        # P/D disaggregation, keyed by the *peer instance* rather than summed:
+        # a batch may hold requests routed to different decode instances, and
+        # one CHAKRA graph can only carry one destination per send node. So the
+        # peers are kept apart here and split into one send node each by the
+        # converter.``pd_kv_send_tokens`` is ``{decode_instance_id: tokens}`` on
+        # the prefill side, ``pd_kv_recv_tokens`` is
+        # ``{prefill_instance_id: tokens}`` on the decode side; both count
+        # prefix-cache hits on a request's first step, because the decode side
+        # needs that KV even though the prefill side did not compute it.
+        self.pd_kv_send_tokens = pd_kv_send_tokens or {}
+        self.pd_kv_recv_tokens = pd_kv_recv_tokens or {}
         # for attn prediction
         self.q_list = q_list
         self.k_list = k_list

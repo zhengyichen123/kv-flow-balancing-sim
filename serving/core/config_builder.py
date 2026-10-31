@@ -250,19 +250,18 @@ def _compute_network_dims(instances):
                 else [tp_size, len(first_group)])
     else:
         # Independent instances: standard topology.
-        total_npu = sum(
-            inst["num_npus"] if inst.get("pd_type") != "prefill"
-            else inst["num_npus"] * 2
-            for inst in instances
-        )
-        total_pp = sum(
-            inst["pp_size"] if inst.get("pd_type") != "prefill"
-            else inst["pp_size"] * 2
-            for inst in instances
-        )
-        num_instances = len(instances) + sum(
-            1 for inst in instances if inst.get("pd_type") == "prefill"
-        )
+        #
+        # A prefill instance used to be counted twice here, because it owned a
+        # second (shadow) group of NPUs that only received the KV stream. The
+        # KV now goes straight to the decode instance over the network (see
+        # llm_converter), so a prefill instance occupies exactly its own slots
+        # -- the same rule npu2inst_mapping follows. Counting it twice declares
+        # NPUs that mapping has no entry for, and ASTRA-Sim does run those
+        # phantom ranks: their first report hits npu2inst_mapping as a
+        # KeyError.
+        total_npu = sum(inst["num_npus"] for inst in instances)
+        total_pp = sum(inst["pp_size"] for inst in instances)
+        num_instances = len(instances)
         if total_npu == total_pp:
             npus_per_group = total_npu // num_instances
             dims = [npus_per_group, num_instances]
@@ -610,10 +609,12 @@ def build_cluster_config(astra_sim, cluster_config_path, enable_local_offloading
             instance_id = instance.get("instance_id")
             inst2npu_mapping[instance_id] = current_npu_start
             start_npu_ids += str(current_npu_start) + ","       # npus to check start condition
-            # Add sender NPUs in prefill instance
+            # A prefill instance occupies only its own compute slots. The KV
+            # stream is sent straight to the paired decode instance (see
+            # llm_converter), so prefill no longer owns a shadow set of
+            # receiving NPUs.
             effective_npus = num_npus
             if pd_type == "prefill":
-                effective_npus = num_npus * 2
                 prefill_instance.append(instance_id)
             elif pd_type == "decode":
                 decode_instance.append(instance_id)
@@ -688,11 +689,11 @@ def build_cluster_config(astra_sim, cluster_config_path, enable_local_offloading
         
         node_id += 1
 
-    total_npu = sum(
-        inst["num_npus"] if inst["pd_type"] != "prefill"
-        else inst["num_npus"] * 2
-        for inst in total_instances
-    )
+    # Same rule as _compute_network_dims: a prefill instance no longer owns a
+    # shadow group, so the count has to match npu2inst_mapping exactly. A
+    # larger total here makes _prepare_ns3_config accept a topology with more
+    # ranks than the frontend can name.
+    total_npu = sum(inst["num_npus"] for inst in total_instances)
 
     # Resolve DP groups across all instances.
     _resolve_dp_groups(total_instances)

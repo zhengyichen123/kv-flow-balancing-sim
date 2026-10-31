@@ -149,6 +149,8 @@ def _select_ns3_topology(astra_sim, total_npu):
     """
     topology_dir = os.path.join(astra_sim, "extern/network_backend/ns-3/scratch/topology")
     candidates = (
+        (8, "pd_kv_2leaf_4spine.txt"),
+        (16, "pd_kv_16gpu_2leaf_4spine.txt"),
         (8, "8_nodes_2leaf_2spine_topology.txt"),
         (8, "8_nodes_1_switch_topology.txt"),
         (128, "128_nodes_32_switch_topology.txt"),
@@ -573,6 +575,13 @@ def main():
                         help='request routing policy across instances: LOAD (vLLM-style weighted least-loaded, default), '
                         'RR (round-robin), RAND (random), CUSTOM (requires implementing '
                         'the shipped NotImplementedError stub in serving/core/router.py)')
+    parser.add_argument('--pd-pairing', type=str, choices=['static', 'dynamic'],
+                        default='static', dest='pd_pairing',
+                        help='how a prefill instance picks the decode peer that receives '
+                        'its KV: static (default; prefill i always pairs with decode '
+                        'i %% num_decode, so a run\'s P/D flow pattern is fixed and a '
+                        'routing change is the only variable between two runs), dynamic '
+                        '(re-chosen per request by --request-routing-policy)')
     parser.add_argument('--expert-routing-policy', type=str,
                         choices=['BALANCED', 'RR', 'RAND', 'CUSTOM'],
                         default='BALANCED',
@@ -890,7 +899,8 @@ def main():
     # Controller for astra-sim process communication
     controller = Controller(total_npu)
     # Global Request Router
-    router = Router(num_instances, schedulers, num_req, request_routing_policy)
+    router = Router(num_instances, schedulers, num_req, request_routing_policy,
+                    pd_pairing=args.pd_pairing)
     # Power Modeling if enabled
     if power_modeling:
         power_model = PowerModel(power_configs)
@@ -1058,10 +1068,6 @@ def main():
             for req in finished_reqs:
                 router.notify_request_completed(req.id, current)
 
-        # Add prefill ended requests to decode instance
-        if instances[instance_id]["pd_type"] == "prefill" and len(finished_reqs) > 0:
-            router.transfer_prefill_request(finished_reqs)
-
         # An NPU that opened a DP round owes ASTRA-Sim that round's graph, and it
         # has to be handed over before the scheduler may open anything new. vLLM
         # schedules and dispatches in one step (``schedule()`` then
@@ -1167,7 +1173,8 @@ def main():
                                    num_speculative_tokens=(
                                        schedulers[instance_id].spec.N
                                        if schedulers[instance_id].spec else 0),
-                                   gate_stats_path=args.gate_stats)
+                                   gate_stats_path=args.gate_stats,
+                                   inst2npu_mapping=inst2npu_mapping)
                         generate_graph(batch, inst["hardware"], inst["num_npus"], nid,
                                        inst_id, inst2npu_mapping[inst_id],
                                        inst_cfg["enable_local_offloading"],
@@ -1259,7 +1266,8 @@ def main():
                                    num_speculative_tokens=(
                                        schedulers[instance_id].spec.N
                                        if schedulers[instance_id].spec else 0),
-                                   gate_stats_path=args.gate_stats)
+                                   gate_stats_path=args.gate_stats,
+                                   inst2npu_mapping=inst2npu_mapping)
                             generate_graph(batch, inst["hardware"], inst["num_npus"], nid,
                                            inst_id, inst2npu_mapping[inst_id],
                                            inst_cfg["enable_local_offloading"],
@@ -1308,7 +1316,8 @@ def main():
                                    num_speculative_tokens=(
                                        schedulers[instance_id].spec.N
                                        if schedulers[instance_id].spec else 0),
-                                   gate_stats_path=args.gate_stats)
+                                   gate_stats_path=args.gate_stats,
+                                   inst2npu_mapping=inst2npu_mapping)
                     generate_graph(new_req, instance["hardware"], instance["num_npus"], node_id,
                                    instance_id, inst2npu_mapping[instance_id],
                                    inst_cfg["enable_local_offloading"],

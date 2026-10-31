@@ -51,7 +51,14 @@ class Scheduler:
         self.req_num = req_num
         self.start_npu = start_npu
         self.pd_type = pd_type
-        self.enable_prefix_caching = enable_prefix_caching
+        # A decode instance never runs a prompt, so it never performs the prefix
+        # lookup that prefix caching exists to serve: add_decode hands it
+        # requests straight into ``running``, bypassing the waiting queue where
+        # the tier lookup lives. Leaving caching on would merely index the KV the
+        # prefill instance computed and sent into this instance's own pool --
+        # registering blocks it never produced -- and write them down a tier.
+        # Prefix caching is a prefill-side feature here.
+        self.enable_prefix_caching = enable_prefix_caching and pd_type != "decode"
         self.enable_prefix_sharing = enable_prefix_sharing
         self.enable_chunked_prefill = enable_chunked_prefill
         self.prefix_storage = prefix_storage
@@ -135,7 +142,7 @@ class Scheduler:
         self.num_preemptions = 0
 
         self.memory = MemoryModel(model, instance_id, node_id, num_npus, tp_size, npu_mem, cpu_mem,
-                                  block_size, fp, enable_prefix_caching, enable_prefix_sharing,
+                                  block_size, fp, self.enable_prefix_caching, enable_prefix_sharing,
                                   prefix_pool, prefix_storage, cxl_mem, ep_size=ep_size,
                                   pp_size=pp_size, kv_cache_dtype=kv_cache_dtype,
                                   npu_memory_utilization=npu_memory_utilization,
@@ -517,7 +524,8 @@ class Scheduler:
         decode_q_lens = []
         scheduled_tokens = {}
         spec_scheduled = {}
-        pd_kv_send_tokens = 0
+        pd_kv_send_tokens = {}
+        pd_kv_recv_tokens = {}
 
         for req, num_new, computed_before in scheduled:
             scheduled_tokens[req.id] = num_new
@@ -554,12 +562,32 @@ class Scheduler:
             if req.is_init:
                 req.set_que_delay(current)
             if self.pd_type == "prefill":
-                # The paired decode instance needs this chunk's KV, plus the KV
-                # of any prefix-cache hit -- it was never computed here, but the
-                # decode side still needs it.
-                pd_kv_send_tokens += num_new
-                if computed_before == 0:
-                    pd_kv_send_tokens += req.prefix_cache_hit
+                # The request's own decode instance needs this chunk's KV, plus
+                # the KV of any prefix-cache hit -- it was never computed here,
+                # but the decode side still needs it. Bucketed per peer: a batch
+                # can mix requests bound for different decode instances, and the
+                # chunk each one needs differs with its own chunking.
+                peer = req.decode_instance_id
+                if peer is not None:
+                    pd_kv_send_tokens[peer] = pd_kv_send_tokens.get(peer, 0) + num_new
+                    # The hit is owed once, on the request's first admission --
+                    # not on "the first chunk", which is what comparing
+                    # computed_before to 0 would test: with a hit, the first
+                    # chunk's computed_before *is* the hit, so that test never
+                    # fired and the decode side was left short by exactly the
+                    # hit, hanging its receive.
+                    if not req.pd_kv_hit_sent:
+                        pd_kv_send_tokens[peer] += req.prefix_cache_hit
+                        req.pd_kv_hit_sent = True
+            elif req.pd_kv_pending_tokens:
+                # Decode side: this is the step that has to wait for the KV
+                # stream, so the receive is charged here and only here. Later
+                # steps find it cleared and emit no receive node.
+                pd_kv_recv_tokens[req.prefill_instance_id] = (
+                    pd_kv_recv_tokens.get(req.prefill_instance_id, 0)
+                    + req.pd_kv_pending_tokens
+                )
+                req.pd_kv_pending_tokens = 0
 
             # vLLM advances num_computed_tokens at schedule time
             # (_update_after_schedule), not at completion. With pp_size > 1 two
@@ -576,7 +604,8 @@ class Scheduler:
                       # One shot per batch, so a mixed batch takes the longest
                       # decode query -- the kernel is launched for the whole
                       # batch and its cost follows the widest row.
-                      decode_q_len=max(decode_q_lens) if decode_q_lens else 1)
+                      decode_q_len=max(decode_q_lens) if decode_q_lens else 1,
+                      pd_kv_recv_tokens=pd_kv_recv_tokens)
         batch.fired.append(sys)
         batch.requests.extend(req for req, _, _ in scheduled)
         batch.scheduled_tokens = scheduled_tokens
@@ -619,9 +648,12 @@ class Scheduler:
             return prompt_t, gen_t, end_reqs
 
         batch.end.append(sys)
-        # A prefill instance also waits for its paired decode NPUs, which
-        # receive the streamed KV.
-        last_npu = self.num_npus * (2 if self.pd_type == "prefill" else 1) - 1
+        # A batch now spans exactly the NPUs this instance owns. Under P/D the
+        # KV leaves over the network from those same NPUs -- there used to be a
+        # second (shadow) NPU group that only received it -- so waiting on a
+        # rank beyond the block would wait for a system that never reports back
+        # and the batch would never complete.
+        last_npu = self.num_npus - 1
         if self.start_npu not in batch.end or (self.start_npu + last_npu) not in batch.end:
             return prompt_t, gen_t, end_reqs
 
@@ -703,7 +735,18 @@ class Scheduler:
                 req.num_tokens_reached += committed
                 gen_t += committed
                 if not prefill_done_now:
-                    req.add_itl(finish)
+                    if req.ttft < 0:
+                        # Under P/D the object that records TTFT belongs to the
+                        # prefill instance. This decode-side copy was made at
+                        # arrival, before prefill ran, so it starts blank -- its
+                        # first token is the first one the user actually sees,
+                        # so TTFT is measured here and spans prefill, the KV
+                        # transfer and one decode step rather than prefill
+                        # alone. recent_end is set by set_ttft, so the ITL
+                        # chain starts at the first token instead of at 0.
+                        req.set_ttft(finish)
+                    else:
+                        req.add_itl(finish)
                 if self.enable_prefix_caching:
                     self.kv.cache_blocks(req, req.num_computed_tokens)
 
@@ -745,28 +788,61 @@ class Scheduler:
         # that has not arrived yet. Dynamically released agentic sub-requests
         # arrive mid-run, hence insort rather than append.
         bisect.insort(self.waiting, new_req, key=lambda r: (r.arrival, r.id))
-        return
+        # Handed back so the router can pair this prefill-side object with a
+        # decode instance while the arrival is still being processed.
+        return new_req
 
     def add_decode(self, req):
-        """Take over a request whose prefill ran on another instance.
+        """Take over a request whose prefill runs on another instance.
 
-        The KV transfer itself is already charged: the prefill instance's trace
-        carries a per-layer send to the paired decode NPU. So this only claims
-        the blocks -- reporting no load bytes, or the transfer would be billed
+        The KV transfer itself is charged by the graphs: the prefill instance's
+        trace carries a per-layer send to this instance, and this instance's
+        trace carries the matching per-layer receive. So this only claims the
+        blocks -- reporting no load bytes, or the transfer would be billed
         twice.
+
+        ``req`` is the prefill-side object and is left untouched: the router
+        pairs the two instances at arrival time, long before prefill has run,
+        so mutating it here would relabel a request that has not even started
+        on the prefill instance (and would corrupt that instance's report,
+        which reads ``req.instance_id``).
         """
-        req.instance_id = self.instance_id
+        original = req
+        req = Request(
+            original.id, original.model, original.original_input, original.output,
+            original.arrival, self.instance_id,
+            original.input_hash_ids, original.output_hash_ids, is_init=False,
+        )
+        # Constructing with instance_id=self.instance_id makes the decode
+        # instance look like the prefill one; keep the real origin so the trace
+        # generator can bucket the received bytes by peer.
+        req.prefill_instance_id = original.prefill_instance_id
+        req.decode_instance_id = self.instance_id
+        req.session_id = original.session_id
+        req.sub_request_index = original.sub_request_index
+        # The prefill instance holds every prompt token's KV and hands it over,
+        # so as far as this instance is concerned the whole prompt is computed.
+        # num_tokens_reached is the length the sequence has reached, not what
+        # this instance computed: the prefill instance samples the first token,
+        # so it is prompt+1 here. Both are set explicitly because this copy is
+        # created before prefill runs and can inherit neither from it.
+        req.num_computed_tokens = req.original_input
+        req.num_tokens_reached = req.original_input + 1
+        # First batch scheduled here owes the network that much KV, one entry
+        # in the trace's receive column (see _build_batch).
+        req.pd_kv_pending_tokens = req.original_input
         req.status = RequestStatus.RUNNING
-        hit_blocks, num_npu_hit, num_lower_hit = self.kv.get_computed_blocks(req)
-        num_computed = req.num_computed_tokens
-        if self.kv.allocate_slots(req, 1, hit_blocks, num_npu_hit, num_lower_hit) is None:
+        # Deliberately no prefix lookup: this instance's pool holds no blocks
+        # for a request it has never run, and every prompt token is arriving
+        # over the network, so all of them need slots. A hit here would
+        # allocate fewer blocks than the received KV occupies.
+        if self.kv.allocate_slots(req, 1) is None:
             raise RuntimeError(
                 f"[Scheduler] [node_id={self.node_id},inst={self.instance_id}] decode "
                 f"instance cannot admit request {req.id}: {req.num_tokens_reached} tokens "
                 f"need more blocks than the pool has free "
                 f"({self.kv.npu_pool.get_num_free_blocks()} of {self.kv.npu_pool.num_blocks})"
             )
-        req.num_computed_tokens = num_computed
         self.kv.take_traffic()          # a P/D handoff is not a recall
         self.running.append(req)
 

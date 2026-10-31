@@ -33,7 +33,8 @@ _FMT = (
     "{:<15} "  # output_size
     "{:<15} "  # comm_type
     "{:<15} "  # comm_size
-    "{:<15}"   # misc
+    "{:<15} "  # misc
+    "{:<40}"   # kv_peers
     "\n"
 )
 
@@ -64,14 +65,15 @@ def header():
     return _FMT.format(
         "Layername", "comp_time", "input_loc", "input_size",
         "weight_loc", "weight_size", "output_loc", "output_size",
-        "comm_type", "comm_size", "misc",
+        "comm_type", "comm_size", "misc", "kv_peers",
     )
 
 
-def formatter(layername, comp_time, input_loc, input_size, weight_loc, weight_size, output_loc, output_size, comm_type, comm_size, misc):
+def formatter(layername, comp_time, input_loc, input_size, weight_loc, weight_size, output_loc, output_size, comm_type, comm_size, misc, kv_peers='-'):
     return _FMT.format(
         layername, comp_time, input_loc, input_size, weight_loc,
         weight_size, output_loc, output_size, comm_type, comm_size, misc,
+        kv_peers,
     )
 
 

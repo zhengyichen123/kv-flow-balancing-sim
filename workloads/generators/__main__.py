@@ -19,10 +19,18 @@ def main() -> int:
     from workloads.generators.sharegpt import register_args as sg_register
     sg_register(sg)
 
+    kv = sub.add_parser("kv_poisson",
+                        help="Zipf prompt lengths + Poisson arrivals -> JSONL")
+    from workloads.generators.kv_poisson import register_args as kv_register
+    kv_register(kv)
+
     args = parser.parse_args()
 
     if args.generator == "sharegpt":
         from workloads.generators.sharegpt import run
+        return run(args)
+    if args.generator == "kv_poisson":
+        from workloads.generators.kv_poisson import run
         return run(args)
 
     parser.error(f"Unknown generator: {args.generator}")

@@ -10,7 +10,8 @@ class Router:
             num_instances,
             schedulers, req_num,
             routing_policy="RR",
-            seed=42
+            seed=42,
+            pd_pairing="static"
     ):
         self.schedulers = schedulers
         self.num_instances = num_instances
@@ -21,6 +22,20 @@ class Router:
         self.req_num = req_num
         self.routing_policy = routing_policy.upper()
         self.seed = seed
+        self.pd_pairing = pd_pairing.upper()
+        if self.pd_pairing not in ("STATIC", "DYNAMIC"):
+            raise ValueError(f"Unknown pd_pairing '{pd_pairing}'. "
+                             "Supported: static, dynamic")
+        # Static P->D pairing: prefill i always ships its KV to decode
+        # ``i % num_decode``. Pinning the pair makes a run's flow pattern
+        # reproducible, so the routing change is the only variable between two
+        # runs. Round-robin over the decode list keeps every decode instance
+        # reachable when the two counts differ.
+        if self.decode_instances:
+            self._static_pd_pair = [i % self.decode_instances
+                                    for i in range(self.prefill_instances)]
+        else:
+            self._static_pd_pair = []
         self._rnd = random.Random(seed) if seed is not None else random
         self.prefill_rr_counter = 0
         self.decode_rr_counter = 0
@@ -191,6 +206,14 @@ class Router:
 
         Called at the start of each iteration in the main simulation loop.
         Returns the number of newly routed requests.
+
+        Under P/D both ends are chosen here, at arrival. The pairing cannot be
+        deferred to the end of prefill: each layer's KV send has to name the
+        NPU that receives it, so the prefill graph needs the decode peer before
+        it can be emitted, and the decode instance must already hold the
+        request when its graph is built. It is also the order real deployments
+        use -- the receiver registers its buffers (NIXL) before the sender
+        pushes.
         """
         routed = 0
         while self._pending_idx < len(self._pending_requests):
@@ -202,18 +225,31 @@ class Router:
             sched = self.prefill_schedulers[instance_id]
 
             if sched.enable_prefix_caching:
-                sched.add_request([
+                req = sched.add_request([
                     req_data['index'], sched.model,
                     req_data['input_toks'], req_data['output_toks'],
                     req_data['arrival_time_ns'], sched.instance_id,
                     req_data.get('input_hash_ids', []), req_data.get('output_hash_ids', []),
                 ], is_init=self._is_init)
             else:
-                sched.add_request([
+                req = sched.add_request([
                     req_data['index'], sched.model,
                     req_data['input_toks'], req_data['output_toks'],
                     req_data['arrival_time_ns'], sched.instance_id,
                 ], is_init=self._is_init)
+
+            if self.decode_schedulers:
+                # Static: the peer is pinned by the prefill instance chosen
+                # above. Dynamic: re-selected per request.
+                if self.pd_pairing == "STATIC":
+                    decode_id = self._static_pd_pair[instance_id]
+                else:
+                    decode_id = self._select_instance(self.decode_schedulers, "decode")
+                decode_sched = self.decode_schedulers[decode_id]
+                # Recorded on the prefill-side object too: _build_batch reads it
+                # to bucket each layer's KV bytes by receiving instance.
+                req.decode_instance_id = decode_sched.instance_id
+                decode_sched.add_decode(req)
 
             self._pending_idx += 1
             routed += 1
@@ -321,7 +357,3 @@ class Router:
                 scheduler.pd_type
             )
 
-    def transfer_prefill_request(self, requests):
-        for req in requests:
-            instance_id = self._select_instance(self.decode_schedulers, "decode")
-            self.decode_schedulers[instance_id].add_decode(req)
