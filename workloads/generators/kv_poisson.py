@@ -50,9 +50,9 @@ def register_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--min-input-toks", type=int, default=1024,
                    dest="min_input_toks",
                    help="Shortest prompt length. Default 1024.")
-    p.add_argument("--max-input-toks", type=int, default=53248,
+    p.add_argument("--max-input-toks", type=int, default=16384,
                    dest="max_input_toks",
-                   help="Longest prompt length. Default 53248.")
+                   help="Longest prompt length. Default 16384.")
     p.add_argument("--output-toks", type=int, default=128,
                    dest="output_toks",
                    help="Decode length for every request. Default 128.")

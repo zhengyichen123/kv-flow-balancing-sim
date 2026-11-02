@@ -417,21 +417,43 @@ int main(int argc, char* argv[]) {
     // understand the same handshake: a rank is asked only when it is runnable
     // (not sleeping), finished, and not suppressed by the `pass <tick>` it
     // received in the current state generation.
-    constexpr long long kSuppressionBackstop = 1000;
+    // A round with no NPU to ask is pure ns-3 event processing and costs
+    // almost nothing; the backstop only covers the rare case where the
+    // frontend's state changed without announcing it. 1000 forced a full
+    // stdout/getline round-trip every 1000 events, which dominates the run
+    // once every rank has gone quiet.
+    constexpr long long kSuppressionBackstop = 1000000;
+    // Hard floor (in *simulated* ns) on speculative re-asks: an NPU that
+    // produced no new work may not be asked again this soon. Genuine wake-ups
+    // (`pass <t>` with a future t) are honoured exactly, so request arrival
+    // timing is untouched. Without this floor the loop degenerates into
+    // "one ns-3 event + one stdout/getline round-trip".
+    static constexpr long long kMinRequeryNs = 1000000;
     vector<long long> pass_gen(num_npus, -1);     // -1 = askable
     vector<long long> pass_deadline(num_npus, 0); //  0 = no deadline
     vector<long long> last_reported_iter(num_npus, -1);
+    vector<long long> last_asked_ns(num_npus, -1);
+    // True while this NPU's suppression comes only from the backstop or from a
+    // "nothing to do" answer -- i.e. a re-ask would be purely speculative.
+    vector<bool> speculative(num_npus, false);
     long long state_gen = 0;
     long long unasked_rounds = 0;
 
     auto askable = [&](int npu_id) {
+        const long long now =
+            static_cast<long long>(Simulator::Now().GetNanoSeconds());
+        const bool blocked_by_floor =
+            speculative[npu_id] && last_asked_ns[npu_id] >= 0 &&
+            now - last_asked_ns[npu_id] < kMinRequeryNs &&
+            static_cast<long long>(systems[npu_id]->workload->iteration) ==
+                last_reported_iter[npu_id];
+        if (blocked_by_floor)
+            return false;
         if (pass_gen[npu_id] < 0)
             return true;
         if (pass_gen[npu_id] != state_gen)
             return true;
-        if (pass_deadline[npu_id] > 0 &&
-            static_cast<long long>(Simulator::Now().GetNanoSeconds()) >=
-                pass_deadline[npu_id])
+        if (pass_deadline[npu_id] > 0 && now >= pass_deadline[npu_id])
             return true;
         return false;
     };
@@ -465,6 +487,8 @@ int main(int argc, char* argv[]) {
                 continue;
 
             asked_any = true;
+            last_asked_ns[i] =
+                static_cast<long long>(Simulator::Now().GetNanoSeconds());
             if (static_cast<long long>(systems[i]->workload->iteration) !=
                 last_reported_iter[i]) {
                 last_reported_iter[i] = systems[i]->workload->iteration;
@@ -477,25 +501,37 @@ int main(int argc, char* argv[]) {
             getline(cin, new_filename);
 
             if (new_filename.rfind("pass", 0) == 0) {
-                // "pass"     -> ask again as soon as possible
-                // "pass <t>" -> ask again once the clock reaches <t>
-                // "pass -1"  -> the frontend's state changed; ask again now
+                // "pass"     -> nothing to do
+                // "pass <t>" -> come back once the clock reaches <t>
+                // "pass -1"  -> the frontend's state changed
+                const long long now =
+                    static_cast<long long>(Simulator::Now().GetNanoSeconds());
                 const long long deadline = (new_filename.size() > 5)
                     ? std::strtoll(new_filename.c_str() + 5, nullptr, 10)
                     : 0;
-                if (deadline < 0) {
-                    ++state_gen;
-                    pass_gen[i] = state_gen;
-                    pass_deadline[i] = 0;
-                } else {
+                if (deadline > now) {
+                    // A real wake-up hint: honour it exactly so the next
+                    // request is still dispatched at its own arrival time.
                     pass_gen[i] = state_gen;
                     pass_deadline[i] = deadline;
+                    speculative[i] = false;
+                } else {
+                    // Either "nothing to do", or a deadline that is already in
+                    // the past (the frontend's clock and ns-3's clock have
+                    // drifted apart). Both mean "ask again soon", which is the
+                    // degenerate path, so rate-limit it.
+                    if (deadline < 0)
+                        ++state_gen;
+                    pass_gen[i] = state_gen;
+                    pass_deadline[i] = now + kMinRequeryNs;
+                    speculative[i] = true;
                 }
                 continue;
             }
 
             ++state_gen;
             pass_gen[i] = -1;
+            speculative[i] = false;
 
             if (new_filename == "exit") {
                 exit = true;

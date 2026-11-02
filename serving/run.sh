@@ -12,7 +12,7 @@
 #     --dataset 'workloads/example_trace.jsonl' --output 'outputs/example_single_run.csv' \
 #     --num-reqs 10
 
-for sps in 30 20 10 5; do
+for sps in 5 10 20 30; do
   n=$((sps * 10))
   python -m serving \
     --cluster-config configs/cluster/dual_node_8p8d.json \
