@@ -187,6 +187,8 @@ Simulator::Run()
 void
 Simulator::PreRun()
 {
+    // 与 Run() 一致，启动后不再为时间精度转换登记每个 Time 对象。
+    Time::ClearMarkedTimes();
     auto* impl = GetImpl();
     auto* d = dynamic_cast<DefaultSimulatorImpl*>(impl);
     NS_ASSERT_MSG(d != nullptr, "Simulator::PreRun is only available with DefaultSimulatorImpl");

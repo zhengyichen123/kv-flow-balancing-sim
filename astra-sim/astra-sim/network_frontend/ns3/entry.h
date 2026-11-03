@@ -11,8 +11,12 @@
 #include "ns3/packet.h"
 #include "ns3/point-to-point-helper.h"
 #include "ns3/qbb-helper.h"
+#include <cstdint>
+#include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <limits>
+#include <memory>
 #include <ns3/rdma-client-helper.h>
 #include <ns3/rdma-client.h>
 #include <ns3/rdma-driver.h>
@@ -24,6 +28,9 @@
 
 using namespace ns3;
 using namespace std;
+
+constexpr int kKvRequestTagBase = 1 << 20;
+unique_ptr<FILE, decltype(&fclose)> kv_fct_output(nullptr, &fclose);
 
 /*
  * This file defines the interaction between the System layer and the NS3
@@ -48,11 +55,11 @@ public:
   // Initialized with the original size of the message, and
   // incremented/decremented depending on how many bytes were sent/received.
   // Eventually, this value will reach 0 when the event has completed.
-  int remaining_msg_bytes;
+  uint64_t remaining_msg_bytes;
   void *fun_arg;
   void (*msg_handler)(void *fun_arg);
 
-  MsgEvent(int _src_id, int _dst_id, int _type, int _remaining_msg_bytes,
+  MsgEvent(int _src_id, int _dst_id, int _type, uint64_t _remaining_msg_bytes,
            void *_fun_arg, void (*_msg_handler)(void *fun_arg))
       : src_id(_src_id), dst_id(_dst_id), type(_type),
         remaining_msg_bytes(_remaining_msg_bytes), fun_arg(_fun_arg),
@@ -92,7 +99,7 @@ map<pair<int, pair<int, int>>, int> sender_src_port_map;
 //   value is for send or receive
 //   - value: Number of bytes this node has sent (if send/receive is 0) and
 //   received (if send/receive is 1)
-map<pair<int, int>, int> node_to_bytes_sent_map;
+map<pair<int, int>, uint64_t> node_to_bytes_sent_map;
 
 // SentHash stores a MsgEvent for sim_send events and its callback handler.
 //   - key: A pair of <MsgEventKey, port_id>. 
@@ -118,12 +125,15 @@ map<MsgEventKey, MsgEvent> sim_recv_waiting_hash;
 //   - key: A MsgEventKey isntance.
 //   - value: The number of bytes that ns3 has simulated completed, but the
 //   System layer has not yet called sim_recv
-map<MsgEventKey, int> received_msg_standby_hash;
+map<MsgEventKey, uint64_t> received_msg_standby_hash;
 
 // send_flow commands the ns3 simulator to schedule a RDMA message to be sent
 // between two pair of nodes. send_flow is triggered by sim_send.
-void send_flow(int src_id, int dst, int maxPacketCount,
+void send_flow(int src_id, int dst, uint64_t message_size,
                void (*msg_handler)(void *fun_arg), void *fun_arg, int tag) {
+  // 当前 RDMA 包头的序号和 ACK 仍是 32 位，超限必须明确报错。
+  NS_ABORT_MSG_IF(message_size > std::numeric_limits<uint32_t>::max(),
+                  "RDMA flow exceeds the 32-bit sequence limit: " << message_size);
   // Get a new port number.
   uint32_t port = portNumber[src_id][dst]++;
   sender_src_port_map[make_pair(port, make_pair(src_id, dst))] = tag;
@@ -132,7 +142,7 @@ void send_flow(int src_id, int dst, int maxPacketCount,
 
   // Create a MsgEvent instance and register callback function.
   MsgEvent send_event =
-      MsgEvent(src_id, dst, 0, maxPacketCount, fun_arg, msg_handler);
+      MsgEvent(src_id, dst, 0, message_size, fun_arg, msg_handler);
   pair<MsgEventKey, int> send_event_key =
       make_pair(make_pair(tag, make_pair(send_event.src_id, send_event.dst_id)),port) ;
   sim_send_waiting_hash[send_event_key] = send_event;
@@ -140,7 +150,7 @@ void send_flow(int src_id, int dst, int maxPacketCount,
   // Create a queue pair and schedule within the ns3 simulator.
   RdmaClientHelper clientHelper(
       pg, serverAddress[src_id], serverAddress[dst], port, dport,
-      maxPacketCount,
+      message_size,
       has_win ? (global_t == 1 ? maxBdp : pairBdp[n.Get(src_id)][n.Get(dst)])
               : 0,
       global_t == 1 ? maxRtt : pairRtt[src_id][dst], msg_handler, fun_arg, tag,
@@ -155,7 +165,7 @@ void send_flow(int src_id, int dst, int maxPacketCount,
 // waiting for this message, register that this message has arrived,
 // so that the system layer can later call the callback handler when sim_recv
 // is called.
-void notify_receiver_receive_data(int src_id, int dst_id, int message_size,
+void notify_receiver_receive_data(int src_id, int dst_id, uint64_t message_size,
                                   int tag) {
 
   MsgEventKey recv_expect_event_key = make_pair(tag, make_pair(src_id, dst_id));
@@ -202,7 +212,7 @@ void notify_receiver_receive_data(int src_id, int dst_id, int message_size,
   }
 }
 
-void notify_sender_sending_finished(int src_id, int dst_id, int message_size,
+void notify_sender_sending_finished(int src_id, int dst_id, uint64_t message_size,
                                     int tag, int src_port) {
   // Lookup the send_event registered at send_flow().
   pair<MsgEventKey, int> send_event_key = make_pair(make_pair(tag, make_pair(src_id, dst_id)), src_port);
@@ -235,21 +245,24 @@ void notify_sender_sending_finished(int src_id, int dst_id, int message_size,
   send_event.callHandler();
 }
 
-void qp_finish_print_log(FILE *fout, Ptr<RdmaQueuePair> q) {
+uint64_t qp_finish_print_log(FILE *fout, Ptr<RdmaQueuePair> q) {
   uint32_t sid = ip_to_node_id(q->sip), did = ip_to_node_id(q->dip);
   uint64_t base_rtt = pairRtt[sid][did], b = pairBw[sid][did];
-  uint32_t total_bytes =
+  uint64_t total_bytes =
       q->m_size +
       ((q->m_size - 1) / packet_payload_size + 1) *
           (CustomHeader::GetStaticWholeHeaderSize() -
            IntHeader::GetStaticSize()); // translate to the minimum bytes
                                         // required (with header but no INT)
-  uint64_t standalone_fct = base_rtt + total_bytes * 8000000000lu / b;
+  uint64_t standalone_fct = base_rtt +
+      static_cast<uint64_t>(static_cast<unsigned __int128>(total_bytes) *
+                            8000000000ULL / b);
   // sip, dip, sport, dport, size (B), start_time, fct (ns), standalone_fct (ns)
   fprintf(fout, "%08x %08x %u %u %lu %lu %lu %lu\n", q->sip.Get(), q->dip.Get(),
           q->sport, q->dport, q->m_size, q->startTime.GetTimeStep(),
           (Simulator::Now() - q->startTime).GetTimeStep(), standalone_fct);
   fflush(fout);
+  return standalone_fct;
 }
 
 // qp_finish is triggered by NS3 to indicate that an RDMA queue pair has
@@ -258,7 +271,7 @@ void qp_finish_print_log(FILE *fout, Ptr<RdmaQueuePair> q) {
 // common.h::SetupNetwork().
 void qp_finish(FILE *fout, Ptr<RdmaQueuePair> q) {
   uint32_t sid = ip_to_node_id(q->sip), did = ip_to_node_id(q->dip);
-  qp_finish_print_log(fout, q);
+  uint64_t standalone_fct = qp_finish_print_log(fout, q);
 
   // remove rxQp from the receiver.
   Ptr<Node> dstNode = n.Get(did);
@@ -274,6 +287,17 @@ void qp_finish(FILE *fout, Ptr<RdmaQueuePair> q) {
   int tag = sender_src_port_map[make_pair(q->sport, make_pair(sid, did))];
   sender_src_port_map.erase(make_pair(q->sport, make_pair(sid, did)));
 
+  // 保留原 fct.txt 格式，另写带请求 ID 的 KV 完成记录。
+  if (tag >= kKvRequestTagBase && kv_fct_output) {
+    fprintf(kv_fct_output.get(), "%u,%u,%u,%u,%lu,%lu,%lu,%lu,%lu\n",
+            static_cast<uint32_t>(tag - kKvRequestTagBase), sid, did, q->sport,
+            q->m_size, static_cast<uint64_t>(q->startTime.GetNanoSeconds()),
+            static_cast<uint64_t>(Simulator::Now().GetNanoSeconds()),
+            static_cast<uint64_t>((Simulator::Now() - q->startTime).GetNanoSeconds()),
+            standalone_fct);
+    fflush(kv_fct_output.get());
+  }
+
   // Let sender knows that the flow has finished.
   notify_sender_sending_finished(sid, did, q->m_size, tag, q->sport);
 
@@ -286,6 +310,16 @@ int setup_ns3_simulation(string network_configuration) {
     return -1;
 
   SetConfig();
+
+  auto kv_path = filesystem::path(fct_output_file).parent_path() / "kv_fct.csv";
+  kv_fct_output.reset(fopen(kv_path.c_str(), "w"));
+  if (!kv_fct_output) {
+    perror("Cannot open request KV FCT output");
+    return -1;
+  }
+  fprintf(kv_fct_output.get(),
+          "request_id,src,dst,sport,bytes,start_ns,end_ns,fct_ns,standalone_fct_ns\n");
+  fflush(kv_fct_output.get());
 
   if (!SetupNetwork(qp_finish)) {
     return -1;

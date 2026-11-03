@@ -1,7 +1,9 @@
 import glob
 import hashlib
+import importlib.util
 import json
 import os
+import sys
 from collections import OrderedDict
 from time import time
 from .request import *
@@ -116,24 +118,36 @@ def _cache_store(key, paths):
 # batches, so a fresh LLMConverter per batch is equivalent to a fresh
 # process. Verified byte-identical over 146 `.et` files.
 #
-# The import resolves to the *installed* chakra in site-packages, not the
-# checked-out tree, so editing the tree requires `pip3 install .` to take
-# effect — see AGENTS.md.
+# 优先加载仓库内的转换器，避免修改源码后仍运行旧的 site-packages 版本。
+# protobuf 和其余 Chakra 工具继续使用已安装包，不重新生成 schema。
 _LLMConverter = None
 _DURATION_ONLY_SYSTEMS = set()
 
 
 def _get_llm_converter():
-    """Import LLMConverter on first use and cache the class.
-
-    Deferred rather than imported at module scope so a broken or
-    not-yet-installed chakra fails when a graph is first converted, rather
-    than at simulator import time.
-    """
+    """首次转换时加载并缓存类；仓库源码优先，缺失时回退安装包。"""
     global _LLMConverter
     if _LLMConverter is None:
-        from chakra.src.converter.llm_converter import LLMConverter
-        _LLMConverter = LLMConverter
+        repo_root = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
+        local_converter = os.path.join(
+            repo_root, "astra-sim", "extern", "graph_frontend", "chakra",
+            "src", "converter", "llm_converter.py")
+        if os.path.isfile(local_converter):
+            name = "chakra.src.converter.llmservingsim_local_converter"
+            spec = importlib.util.spec_from_file_location(name, local_converter)
+            if spec is None or spec.loader is None:
+                raise ImportError(f"Cannot load repository converter: {local_converter}")
+            module = importlib.util.module_from_spec(spec)
+            sys.modules[name] = module
+            try:
+                spec.loader.exec_module(module)
+            except Exception:
+                sys.modules.pop(name, None)
+                raise
+            _LLMConverter = module.LLMConverter
+        else:
+            from chakra.src.converter.llm_converter import LLMConverter
+            _LLMConverter = LLMConverter
     return _LLMConverter
 
 

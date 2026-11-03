@@ -1336,7 +1336,8 @@ def _emit_layer(ctx, bctx, layer_name, lines, power_acc, batch_tag='NONE', layer
                 kv_peers=None):
     """Emit a single trace layer: lookup latency, compute sizes, format, track power.
 
-    ``kv_peers`` is the P/D split of this layer's KV, ``{peer_npu_offset: bytes}``.
+    ``kv_peers`` 保留每请求的 ``{(peer_npu_offset, request_id): bytes}``，
+    同时兼容旧式 ``{peer_npu_offset: bytes}``。
     It goes into a trailing column rather than replacing ``comm_size`` so that
     ``comm_size`` keeps its existing meaning (the layer's collective, or the
     total for power accounting) and every reader that predates the split keeps
@@ -1414,7 +1415,12 @@ def _emit_layer(ctx, bctx, layer_name, lines, power_acc, batch_tag='NONE', layer
 
     wt_loc = get_device(ctx.placement, layer_num, layer_name, "weights")
 
-    peers_col = ','.join(f"{peer}:{nbytes}" for peer, nbytes in sorted((kv_peers or {}).items())) or '-'
+    peers_col = ','.join(
+        f"{':'.join(map(str, peer)) if isinstance(peer, tuple) else peer}:{nbytes}"
+        for peer, nbytes in sorted(
+            (kv_peers or {}).items(),
+            key=lambda item: item[0] if isinstance(item[0], tuple) else (item[0], -1))
+    ) or '-'
 
     lines.append((layer_name, str(latency_ns), input_loc, str(inp), wt_loc,
                   str(wt), output_loc, str(out), comm_type, str(comm_size), batch_tag,
@@ -1469,24 +1475,10 @@ def _shared_tp_collective(ctx, bctx, name):
 
 
 def _pd_kv_peers(ctx, bctx):
-    """Per-layer, per-rank KV bytes, split by the peer that carries them.
+    """逐层、逐 rank 的 KV 字节，保留 (对端 NPU 起点, 请求 ID)。
 
-    Returns ``{peer_npu_offset: bytes}``. The split is what the Chakra converter
-    needs: one layer can only become one send/recv node per peer, and a batch
-    may mix requests bound for different decode instances, so the byte counts
-    have to stay separable all the way from here to the graph.
-
-    The peer is addressed by the *instance's first NPU*, not by instance id,
-    because the converter---and ASTRA-Sim below it---only knows ranks. Each rank
-    of this instance talks to the same-indexed rank of the peer, so the
-    converter adds its own local index back on.
-
-    ``pd_kv_send_tokens`` counts this iteration's computed tokens plus, on a
-    request's first step, its prefix-cache hit: the decode side needs that KV
-    even though the prefill side read it from cache instead of computing it.
-    Using the trace's ``total_len`` instead would silently drop exactly the hit.
-    ``pd_kv_recv_tokens`` is the mirror image on the decode side, charged on the
-    step that has to wait for the stream.
+    对旧式按对端计数的 Batch 仍保留兼容性；正常 serving 使用请求键。
+    最后一轮 prefill 和第一轮 decode 的 token 数都为完整输入长度。
     """
     if ctx.pd_type == 'prefill':
         tokens_by_peer = getattr(bctx.batch, 'pd_kv_send_tokens', None) or {}
@@ -1500,11 +1492,13 @@ def _pd_kv_peers(ctx, bctx):
     kv_dim = ctx.kv_head * ctx.head_dim
     per_token = 2 * kv_dim * ctx.kv_fp // max(ctx.tp_size, 1)
     peers = {}
-    for instance_id, tokens in tokens_by_peer.items():
+    for identity, tokens in tokens_by_peer.items():
+        instance_id = identity[0] if isinstance(identity, tuple) else identity
         offset = mapping.get(instance_id)
         if offset is None or tokens <= 0:
             continue
-        peers[offset] = peers.get(offset, 0) + per_token * tokens
+        key = (offset, identity[1]) if isinstance(identity, tuple) else offset
+        peers[key] = peers.get(key, 0) + per_token * tokens
     return peers
 
 
@@ -2419,24 +2413,10 @@ def _emit_prologue(ctx, bctx, rows, batch_tag='NONE'):
 
 
 def _coalesce_pd_kv_sends(rows, pd_type):
-    """Collapse a batch's per-layer P/D KV rows into one request-level send.
+    """合并同一请求的逐层 KV，不合并不同请求。
 
-    Every layer's ``qkv_proj`` row carries the *same* KV byte count, so the
-    trace as emitted describes N equal sends (N = stack depth) where a
-    disaggregated engine makes one prefill->decode transfer carrying the whole
-    prompt's KV. That is the granularity the routing study needs: a mega
-    elephant flow is one transfer, and splitting it into N small ones lets
-    ECMP average the imbalance away almost by accident.
-
-    Keep one row, scale it by the number of rows that carried KV, and blank
-    the others, so the converter below emits exactly one SEND/RECV pair per
-    peer -- one flow per request. Which row survives sets the timing: prefill
-    keeps the last (the transfer starts once the stack has finished
-    computing), decode keeps the first (the decode rank must hold the whole KV
-    before its first layer runs).
-
-    Power accounting is untouched -- it was already summed per layer while the
-    rows were emitted, before this rewrite.
+    新格式是 peer:request_id:bytes，旧格式 peer:bytes 仍可转换。
+    P 保留最后一层的发送位置，D 保留第一层的接收屏障。
     """
     kv_col = 11
     carriers = [i for i, r in enumerate(rows)
@@ -2444,10 +2424,11 @@ def _coalesce_pd_kv_sends(rows, pd_type):
     if len(carriers) <= 1:
         return
     keep = carriers[-1] if pd_type == 'prefill' else carriers[0]
-    scaled = ','.join(
-        f"{peer}:{int(nbytes) * len(carriers)}"
-        for peer, nbytes in (pair.split(':') for pair in rows[keep][kv_col].split(','))
-    )
+    scaled_parts = []
+    for pair in rows[keep][kv_col].split(','):
+        *identity, nbytes = pair.split(':')
+        scaled_parts.append(f"{':'.join(identity)}:{int(nbytes) * len(carriers)}")
+    scaled = ','.join(scaled_parts)
     rows[keep] = rows[keep][:kv_col] + (scaled,) + rows[keep][kv_col + 1:]
     for i in carriers:
         if i != keep:

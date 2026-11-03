@@ -191,7 +191,7 @@ class ASTRASimNetwork : public AstraSim::AstraNetworkAPI {
             received_msg_standby_hash.end()) {
             // 1) ns3 has already received some message before sim_recv is
             // called.
-            int received_msg_bytes = received_msg_standby_hash[recv_event_key];
+            uint64_t received_msg_bytes = received_msg_standby_hash[recv_event_key];
             if (received_msg_bytes == message_size) {
                 // 1-1) The received message size is same as what we expect.
                 // Exit.
@@ -220,7 +220,7 @@ class ASTRASimNetwork : public AstraSim::AstraNetworkAPI {
             } else {
                 // 2-2) We have already been expecting something.
                 // Increment the number of bytes we are waiting to receive.
-                int expecting_msg_bytes =
+                uint64_t expecting_msg_bytes =
                     sim_recv_waiting_hash[recv_event_key].remaining_msg_bytes;
                 recv_event.remaining_msg_bytes += expecting_msg_bytes;
                 sim_recv_waiting_hash[recv_event_key] = recv_event;

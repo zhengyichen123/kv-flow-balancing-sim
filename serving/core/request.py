@@ -37,12 +37,9 @@ class Request:
         # count rather than a byte count because the per-layer byte size needs
         # the model shape, which only the trace generator has.
         self.pd_kv_pending_tokens = 0
-        # Prefill side only: set once this request's prefix-cache hit has been
-        # added to the KV it sends its decode instance. The hit is owed exactly
-        # once, on the request's *first* admission -- a preempted request later
-        # recomputes from blocks whose KV already went out, so a re-admission
-        # must not add the hit a second time. Never reset by preemption.
-        self.pd_kv_hit_sent = False
+        # 整份 KV 仅在最后一个 prefill 块发送一次，包含 prefix-cache 命中。
+        # 抢占后不重置，避免为同一请求重复创建网络流。
+        self.pd_kv_sent = False
         self.is_init = is_init
         self.original_input = input
         self.num_computed_tokens = 0  # Tracks actual computed tokens (vLLM style)
@@ -167,15 +164,8 @@ class Batch:
         self.kv_size = kv_size
         self.evict = evict
         self.load = load
-        # P/D disaggregation, keyed by the *peer instance* rather than summed:
-        # a batch may hold requests routed to different decode instances, and
-        # one CHAKRA graph can only carry one destination per send node. So the
-        # peers are kept apart here and split into one send node each by the
-        # converter.``pd_kv_send_tokens`` is ``{decode_instance_id: tokens}`` on
-        # the prefill side, ``pd_kv_recv_tokens`` is
-        # ``{prefill_instance_id: tokens}`` on the decode side; both count
-        # prefix-cache hits on a request's first step, because the decode side
-        # needs that KV even though the prefill side did not compute it.
+        # 以 (对端实例, 请求 ID) 为键，不合并同目的端的不同请求。
+        # token 数为完整输入长度，包含 prefix-cache 命中。
         self.pd_kv_send_tokens = pd_kv_send_tokens or {}
         self.pd_kv_recv_tokens = pd_kv_recv_tokens or {}
         # for attn prediction
@@ -215,4 +205,3 @@ class Batch:
         for req in self.requests:
             req.log()
         print("----------------------------------------------------------")
-    

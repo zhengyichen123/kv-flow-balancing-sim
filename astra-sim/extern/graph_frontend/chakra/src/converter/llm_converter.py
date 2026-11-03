@@ -25,9 +25,8 @@ class MemoryType(Enum):
 # converted independently, each numbering its comm tags from zero. So
 # ``get_next_comm_tag`` cannot pair them: rank 0's first KV send would be tag 0
 # while the decode rank's first KV recv might be tag 0 for a different layer, or
-# 0 for layer 3 after some other message took 0. KV tags are therefore a pure
-# function of the hop's position in the KV layer sequence, over a base high
-# enough that the automatic counter never reaches it.
+# 0 for layer 3 after some other message took 0.
+# 新请求级传输使用 KV_TAG_BASE + request_id；旧格式仍使用层序号。
 KV_TAG_BASE = 1 << 20
 
 
@@ -104,8 +103,8 @@ class Layer:
 
                 self.misc = str(col[10])
 
-                # P/D disaggregation: this layer's KV split by destination,
-                # ``{peer_npu_offset: bytes}``, encoded as "peerN:bytes,..."
+                # 新格式 peer:request_id:bytes 保留请求身份，不按目的合并。
+                # 旧格式 peer:bytes 继续支持。
                 # or "-" when the layer ships no KV. It is a column of its
                 # own rather than part of ``comm_size`` because one batch can
                 # mix requests bound for different decode instances while a
@@ -116,9 +115,17 @@ class Layer:
                 self.kv_peers = {}
                 if len(col) > 11 and col[11] != '-':
                     for part in col[11].split(','):
-                        peer, nbytes = part.split(':')
+                        fields = part.split(':')
+                        if len(fields) == 3:
+                            peer, request_id, nbytes = fields
+                            key = (int(peer), int(request_id))
+                            if key in self.kv_peers:
+                                raise ValueError("duplicate KV request entry")
+                        else:
+                            peer, nbytes = fields
+                            key = int(peer)
                         if int(nbytes) > 0:
-                            self.kv_peers[int(peer)] = int(nbytes)
+                            self.kv_peers[key] = int(nbytes)
         except:
             raise ValueError(f"Cannot parse the following layer -- \"{line}\"")
 
@@ -285,7 +292,7 @@ class LLMConverter:
 
     def get_comm_node(self, is_send: bool, layer_name: str, comm_type: str, comm_size: int,
                            comm_src: int, comm_dst: int, id: int = 0,
-                           tag: int = None) -> Any:
+                           tag: int = None, request_id: int = None) -> Any:
         if is_send:
             node = self.get_node(
                     f"COMM_SEND_NODE_{layer_name}_{comm_type}_{comm_src}_{comm_dst}",
@@ -298,6 +305,9 @@ class LLMConverter:
         node.attr.append(ChakraAttr(name="comm_src", int32_val=comm_src))
         node.attr.append(ChakraAttr(name="comm_dst", int32_val=comm_dst))
         node.attr.append(ChakraAttr(name="comm_size", int64_val=comm_size))
+        if request_id is not None:
+            node.name += f"_request_{request_id}"
+            node.attr.append(ChakraAttr(name="kv_request_id", uint64_val=request_id))
         if tag is not None:
             # Caller owns the tag. The P/D KV hops need this: their SEND and
             # RECV live in graphs produced by different converter instances,
@@ -316,6 +326,21 @@ class LLMConverter:
         # check if SEND/RECV pair have same tags
         # print(f"name: {node.name}, src: {node.comm_src}, dst: {node.comm_dst}, size: {node.comm_size}, key: {comm_key}, tag: {node.comm_tag}")
         return node
+
+    @staticmethod
+    def iter_kv_transfers(layer, kv_seq):
+        """分别转换每个请求，SEND/RECV 使用相同的确定性标签。"""
+        items = sorted(
+            layer.kv_peers.items(),
+            key=lambda item: item[0] if isinstance(item[0], tuple) else (item[0], -1))
+        for identity, nbytes in items:
+            if isinstance(identity, tuple):
+                peer, request_id = identity
+                if not 0 <= request_id <= (1 << 31) - 1 - KV_TAG_BASE:
+                    raise ValueError(f"KV request ID outside tag range: {request_id}")
+                yield peer, nbytes, KV_TAG_BASE + request_id, request_id
+            else:
+                yield identity, nbytes, KV_TAG_BASE + kv_seq, None
     
     def get_mem_type(self, mem_type: str) -> int:
         mem_type = mem_type.split(':')[0]  # Exclude the device number if present
@@ -621,8 +646,8 @@ class LLMConverter:
                                 # Colocated traces leave ``kv_peers`` empty, so
                                 # this is a no-op there.
                                 if layers[layer_num].kv_peers:
-                                    for peer_offset, kv_bytes in sorted(
-                                            layers[layer_num].kv_peers.items()):
+                                    for peer_offset, kv_bytes, kv_tag, kv_request_id in (
+                                            self.iter_kv_transfers(layers[layer_num], kv_seq)):
                                         recv_kv_node = self.get_comm_node(
                                             is_send=False,
                                             layer_name="kv_proj",
@@ -633,7 +658,8 @@ class LLMConverter:
                                             comm_src=peer_offset + local_rank,
                                             comm_dst=npu_id,
                                             id=layer_num,
-                                            tag=KV_TAG_BASE + kv_seq)
+                                            tag=kv_tag,
+                                            request_id=kv_request_id)
                                         encode_message(g, recv_kv_node)
                                         self.add_parent(comp_node, recv_kv_node)
                                     kv_seq += 1
@@ -979,8 +1005,8 @@ class LLMConverter:
                                 # (q_dim + 2*kv_dim) / (2*kv_dim), 3x for
                                 # Llama-3.1-8B, and ignored kv_cache_dtype.
                                 if "v_proj" in layers[layer_num].name and layers[layer_num].kv_peers:
-                                    for peer_offset, kv_bytes in sorted(
-                                            layers[layer_num].kv_peers.items()):
+                                    for peer_offset, kv_bytes, kv_tag, kv_request_id in (
+                                            self.iter_kv_transfers(layers[layer_num], kv_seq)):
                                         send_kv_node = self.get_comm_node(
                                             is_send=True,
                                             layer_name="kv_proj",
@@ -993,7 +1019,8 @@ class LLMConverter:
                                             # to shard i of the decode tp group.
                                             comm_dst=peer_offset + local_rank,
                                             id=layer_num,
-                                            tag=KV_TAG_BASE + kv_seq)
+                                            tag=kv_tag,
+                                            request_id=kv_request_id)
                                         self.add_parent(send_kv_node, comp_node)
                                         encode_message(g, send_kv_node)
                                     kv_seq += 1

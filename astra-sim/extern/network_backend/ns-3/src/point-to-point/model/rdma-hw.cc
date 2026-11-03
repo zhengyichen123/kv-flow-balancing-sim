@@ -1,3 +1,5 @@
+#include <algorithm>
+#include <ns3/abort.h>
 #include <ns3/simulator.h>
 #include <ns3/seq-ts-header.h>
 #include <ns3/udp-header.h>
@@ -595,9 +597,11 @@ void RdmaHw::RedistributeQp(){
 }
 
 Ptr<Packet> RdmaHw::GetNxtPacket(Ptr<RdmaQueuePair> qp){
-	uint32_t payload_size = qp->GetBytesLeft();
-	if (m_mtu < payload_size)
-		payload_size = m_mtu;
+	// 先在 64 位范围内限制到 MTU，再缩窄成单包长度。
+	uint32_t payload_size = static_cast<uint32_t>(
+		std::min<uint64_t>(qp->GetBytesLeft(), m_mtu));
+	NS_ABORT_MSG_IF(payload_size == 0,
+		"RDMA attempted to generate a zero-payload packet");
 	Ptr<Packet> p = Create<Packet> (payload_size);
 	// add SeqTsHeader
 	SeqTsHeader seqTs;

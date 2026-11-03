@@ -562,31 +562,17 @@ class Scheduler:
             if req.is_init:
                 req.set_que_delay(current)
             if self.pd_type == "prefill":
-                # The request's own decode instance needs this chunk's KV, plus
-                # the KV of any prefix-cache hit -- it was never computed here,
-                # but the decode side still needs it. Bucketed per peer: a batch
-                # can mix requests bound for different decode instances, and the
-                # chunk each one needs differs with its own chunking.
+                # 中间 prefill 块只计算；最后一块发送整份请求 KV。
+                # 使用完整输入长度，不能漏掉 prefix-cache 的已有 KV。
                 peer = req.decode_instance_id
-                if peer is not None:
-                    pd_kv_send_tokens[peer] = pd_kv_send_tokens.get(peer, 0) + num_new
-                    # The hit is owed once, on the request's first admission --
-                    # not on "the first chunk", which is what comparing
-                    # computed_before to 0 would test: with a hit, the first
-                    # chunk's computed_before *is* the hit, so that test never
-                    # fired and the decode side was left short by exactly the
-                    # hit, hanging its receive.
-                    if not req.pd_kv_hit_sent:
-                        pd_kv_send_tokens[peer] += req.prefix_cache_hit
-                        req.pd_kv_hit_sent = True
+                if (peer is not None and not req.pd_kv_sent
+                        and computed_before + num_new >= req.original_input):
+                    pd_kv_send_tokens[(peer, req.id)] = req.original_input
+                    req.pd_kv_sent = True
             elif req.pd_kv_pending_tokens:
-                # Decode side: this is the step that has to wait for the KV
-                # stream, so the receive is charged here and only here. Later
-                # steps find it cleared and emit no receive node.
-                pd_kv_recv_tokens[req.prefill_instance_id] = (
-                    pd_kv_recv_tokens.get(req.prefill_instance_id, 0)
-                    + req.pd_kv_pending_tokens
-                )
+                # 每个请求独立等待一次整份 KV，不按 prefill 端合并。
+                pd_kv_recv_tokens[(req.prefill_instance_id, req.id)] = (
+                    req.pd_kv_pending_tokens)
                 req.pd_kv_pending_tokens = 0
 
             # vLLM advances num_computed_tokens at schedule time
