@@ -14,6 +14,7 @@
 #include "ppp-header.h"
 #include "qbb-header.h"
 #include "cn-header.h"
+#include "kv-routing-policy.h"
 
 namespace ns3{
 
@@ -242,6 +243,11 @@ void RdmaHw::AddQueuePair(uint32_t src, uint32_t dest, uint64_t tag, uint64_t si
 	qp->SetVarWin(m_var_win);
 	qp->SetAppNotifyCallback(notifyAppFinish);
 	qp->SetAppSentCallback(notifyAppSent);
+        if (tag >= (1 << 20) &&
+            KvRoutingPolicy::Create(KvRoutingConfig::Get().mode)->Transport() != KvTransport::LEGACY) {
+                AddKvParent(qp);
+                return;
+        }
 	// add qp
 	uint32_t nic_idx = GetNicIdxOfQp(qp);
 	m_nic[nic_idx].qpGrp->AddQp(qp);
@@ -340,6 +346,15 @@ int RdmaHw::ReceiveUdp(Ptr<Packet> p, CustomHeader &ch){
 	uint32_t payload_size = p->GetSize() - ch.GetSerializedSize();
 	// TODO find corresponding rx queue pair
 	Ptr<RdmaRxQueuePair> rxQp = GetRxQp(ch.dip, ch.sip, ch.udp.dport, ch.udp.sport, ch.udp.pg, true);
+        if (ch.kvPresent && rxQp->kvTransfer && rxQp->kvTransfer != ch.kv.transfer) {
+                if (ch.kv.transfer < rxQp->kvTransfer) return 0;
+                const auto key = (uint64_t(ch.sip) << 32) | (uint64_t(ch.udp.pg) << 16) |
+                                 ch.udp.sport;
+                NS_ABORT_MSG_IF(!rxQp->kvDone, "Active KV receiver port reused");
+                m_rxQpMap.erase(key);
+                m_kvRxExpiry.erase(key);
+                rxQp = GetRxQp(ch.dip, ch.sip, ch.udp.dport, ch.udp.sport, ch.udp.pg, true);
+        }
 	uint32_t nic_id = GetNicIdxOfRxQp(rxQp);
     if (enable_pcie_pause){ //&& ((m_node->GetId())%16 == 0 || (m_node->GetId())%16 == 8)) { //&& Simulator::Now().GetMicroSeconds() > m_node->GetId(4)
       PCIePause(nic_id, ch.udp.pg);
@@ -352,9 +367,13 @@ int RdmaHw::ReceiveUdp(Ptr<Packet> p, CustomHeader &ch){
 	rxQp->m_ecn_source.total++;
 	rxQp->m_milestone_rx = m_ack_interval;
 
-	int x = ReceiverCheckSeq(ch.udp.seq, rxQp, payload_size);
+        int x = ReceiverCheckSeq(ch.udp.seq, rxQp, payload_size);
+        if (ch.kvPresent) {
+                ObserveKvReceive(rxQp, ch);
+                if (x == 3) x = 1; // 重复 DATA 重发 ACK，不重计完成字节。
+        }
 
-	if(x !=1 && x!=2){
+        if(x !=1 && x!=2 && !ch.kvPresent){
 		std::cout << Simulator::Now().GetNanoSeconds() << " Rx ";
 		Ipv4Address(ch.sip).Print(std::cout);
 		std::cout << " " << ch.udp.sport << " ";
@@ -374,6 +393,11 @@ int RdmaHw::ReceiveUdp(Ptr<Packet> p, CustomHeader &ch){
 			seqh.SetCnp();
 
 		Ptr<Packet> newp = Create<Packet>(std::max(60-14-20-(int)seqh.GetSerializedSize(), 0));
+                if (ch.kvPresent) {
+                        auto header = ch.kv;
+                        header.flags |= KvBlockHeader::ACK;
+                        newp->AddHeader(header);
+                }
 		newp->AddHeader(seqh);
 
 		Ipv4Header head;	// Prepare IPv4 header
@@ -447,18 +471,35 @@ int RdmaHw::ReceiveAck(Ptr<Packet> p, CustomHeader &ch){
 	if (!qp){
 		return 0;
 	}
+        if (qp->kvParent && (!ch.kvPresent ||
+            ch.kv.transfer != qp->kvParent->id ||
+            (!qp->kvParent->mega && ch.kv.block != qp->kvMeta.block))) return 0;
+        if (qp->kvParent && cnp && m_cc_mode == 1 && !qp->kvParent->done)
+                cnp_received_mlx(qp->kvParent->control);
 
 	uint32_t nic_idx = GetNicIdxOfQp(qp);
 	Ptr<QbbNetDevice> dev = m_nic[nic_idx].dev;
 	if (m_ack_interval == 0)
 		std::cout << "ERROR: shouldn't receive ack\n";
 	else {
+                const uint64_t beforeAck = qp->snd_una;
+                const uint64_t beforeSent = qp->snd_nxt;
 		if (!m_backto0){
 			qp->Acknowledge(seq);
 		}else {
 			uint32_t goback_seq = seq / m_chunk * m_chunk;
 			qp->Acknowledge(goback_seq);
 		}
+                if (qp->kvParent && qp->snd_una > beforeAck) {
+                        auto parent = qp->kvParent;
+                        const auto delta = std::min(qp->snd_una - beforeAck,
+                            beforeSent > beforeAck ? beforeSent - beforeAck : 0);
+                        NS_ABORT_MSG_IF(delta > parent->inFlight, "KV window accounting underflow");
+                        parent->inFlight -= delta;
+                        parent->lastProgress = Simulator::Now().GetNanoSeconds();
+                        parent->warned = false;
+                        qp->snd_nxt = std::max(qp->snd_nxt, qp->snd_una);
+                }
 		if (qp->IsFinished()){
 			QpComplete(qp);
 		}
@@ -468,7 +509,7 @@ int RdmaHw::ReceiveAck(Ptr<Packet> p, CustomHeader &ch){
 
 	// handle cnp
 	if (cnp){
-		if (m_cc_mode == 1){ // mlx version
+                if (m_cc_mode == 1 && !qp->kvParent){ // mlx version
 			cnp_received_mlx(qp);
 		}
 	}
@@ -544,10 +585,19 @@ uint16_t RdmaHw::EtherToPpp (uint16_t proto){
 }
 
 void RdmaHw::RecoverQueue(Ptr<RdmaQueuePair> qp){
+        if (qp->kvParent) {
+                const auto bytes = qp->snd_nxt - qp->snd_una;
+                NS_ABORT_MSG_IF(bytes > qp->kvParent->inFlight, "KV recovery window underflow");
+                qp->kvParent->inFlight -= bytes;
+        }
 	qp->snd_nxt = qp->snd_una;
 }
 
 void RdmaHw::QpComplete(Ptr<RdmaQueuePair> qp){
+        if (qp->kvParent) {
+                CompleteKvBlock(qp);
+                return;
+        }
 	NS_ASSERT(!m_qpCompleteCallback.IsNull());
 	if (m_cc_mode == 1){
 		Simulator::Cancel(qp->mlx.m_eventUpdateAlpha);
@@ -602,7 +652,25 @@ Ptr<Packet> RdmaHw::GetNxtPacket(Ptr<RdmaQueuePair> qp){
 		std::min<uint64_t>(qp->GetBytesLeft(), m_mtu));
 	NS_ABORT_MSG_IF(payload_size == 0,
 		"RDMA attempted to generate a zero-payload packet");
+        if (qp->kvParent) {
+                const auto& cfg = KvRoutingConfig::Get();
+                const auto offset = qp->snd_nxt % cfg.blockBytes;
+                payload_size = std::min<uint32_t>(payload_size, cfg.blockBytes - offset);
+                if (qp->kvParent->mega) qp->kvMeta.block = qp->snd_nxt / cfg.blockBytes;
+                qp->kvMeta.offset = offset;
+                qp->kvMeta.validBytes = std::min<uint64_t>(cfg.blockBytes,
+                    qp->kvParent->validBytes - uint64_t(qp->kvMeta.block) * cfg.blockBytes);
+                if (!qp->kvSent) {
+                        qp->kvSent = true; qp->kvFirstTx = Simulator::Now().GetNanoSeconds();
+                }
+                if (!qp->kvParent->sent) {
+                        qp->kvParent->sent = true;
+                        qp->kvParent->firstTx = Simulator::Now().GetNanoSeconds();
+                }
+                qp->kvParent->inFlight += payload_size;
+        }
 	Ptr<Packet> p = Create<Packet> (payload_size);
+        if (qp->kvParent) p->AddHeader(qp->kvMeta);
 	// add SeqTsHeader
 	SeqTsHeader seqTs;
 	seqTs.SetSeq (qp->snd_nxt);
@@ -642,6 +710,13 @@ void RdmaHw::PktSent(Ptr<RdmaQueuePair> qp, Ptr<Packet> pkt, Time interframeGap)
 }
 
 void RdmaHw::UpdateNextAvail(Ptr<RdmaQueuePair> qp, Time interframeGap, uint32_t pkt_size){
+        if (qp->kvParent) {
+                auto parent = qp->kvParent;
+                auto rate = m_rateBound ? parent->control->m_rate : parent->control->m_max_rate;
+                parent->nextAvail = Simulator::Now() + interframeGap + rate.CalculateBytesTxTime(pkt_size);
+                qp->m_nextAvail = parent->nextAvail;
+                return;
+        }
 	Time sendingTime;
 	if (m_rateBound)
 		sendingTime = interframeGap + qp->m_rate.CalculateBytesTxTime(pkt_size);

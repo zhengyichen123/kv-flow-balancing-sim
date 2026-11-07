@@ -254,6 +254,12 @@ uint64_t qp_finish_print_log(FILE *fout, Ptr<RdmaQueuePair> q) {
           (CustomHeader::GetStaticWholeHeaderSize() -
            IntHeader::GetStaticSize()); // translate to the minimum bytes
                                         // required (with header but no INT)
+  if (q->kvCompletedParent) {
+    const auto& cfg = KvRoutingConfig::Get();
+    const uint64_t blocks = q->m_init_size / cfg.blockBytes;
+    total_bytes = q->m_init_size + blocks * ((cfg.blockBytes + cfg.mtu - 1) / cfg.mtu) *
+                  (36 + KvBlockHeader::SIZE);
+  }
   uint64_t standalone_fct = base_rtt +
       static_cast<uint64_t>(static_cast<unsigned __int128>(total_bytes) *
                             8000000000ULL / b);
@@ -276,7 +282,8 @@ void qp_finish(FILE *fout, Ptr<RdmaQueuePair> q) {
   // remove rxQp from the receiver.
   Ptr<Node> dstNode = n.Get(did);
   Ptr<RdmaDriver> rdma = dstNode->GetObject<RdmaDriver>();
-  rdma->m_rdma->DeleteRxQp(q->sip.Get(), q->m_pg, q->sport);
+  if (!q->kvCompletedParent)
+    rdma->m_rdma->DeleteRxQp(q->sip.Get(), q->m_pg, q->sport);
 
   // Identify the tag of this message.
   if (sender_src_port_map.find(make_pair(q->sport, make_pair(sid, did))) ==

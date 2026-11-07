@@ -35,6 +35,10 @@ build_lib(
     model/rdma-driver.cc
     model/rdma-hw.cc
     model/rdma-queue-pair.cc
+    model/kv-routing-policy.cc
+    model/kv-block-transport.cc
+    model/kv-switch-routing.cc
+    model/ldlb-routing.cc
     model/switch-mmu.cc
     model/switch-node.cc
   HEADER_FILES
@@ -56,11 +60,13 @@ build_lib(
     model/rdma-driver.h
     model/rdma-hw.h
     model/rdma-queue-pair.h
+    model/kv-routing-policy.h
+    model/ldlb-routing.h
     model/switch-mmu.h
     model/switch-node.h
     model/trace-format.h
   LIBRARIES_TO_LINK ${libnetwork}
                     ${mpi_libraries}
                     ${libinternet}
-  TEST_SOURCES test/point-to-point-test.cc
+  TEST_SOURCES test/point-to-point-test.cc test/kv-routing-test.cc
 )

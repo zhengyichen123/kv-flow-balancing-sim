@@ -23,6 +23,7 @@
 
 #include "ns3/header.h"
 #include "ns3/int-header.h"
+#include "ns3/kv-routing-header.h"
 
 namespace ns3 {
 /**
@@ -62,6 +63,8 @@ public:
   virtual uint32_t Deserialize (Buffer::Iterator start);
 
   uint32_t brief, headerType, getInt;
+  bool kvPresent = false;
+  KvBlockHeader kv;
   enum HeaderType{
 	L2_Header = 1,
 	L3_Header = 2,
@@ -143,4 +146,3 @@ public:
 
 
 #endif /* CUSTOM_HEADER_H */
-

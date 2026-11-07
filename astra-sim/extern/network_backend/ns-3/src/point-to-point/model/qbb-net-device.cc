@@ -22,6 +22,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include "ns3/qbb-net-device.h"
+#include "ns3/switch-node.h"
 #include "ns3/log.h"
 #include "ns3/boolean.h"
 #include "ns3/uinteger.h"
@@ -83,6 +84,10 @@ namespace ns3 {
 			return p;
 		}
 		if (qIndex >= 0){ // qp
+                        auto qp = m_qpGrp->Get(qIndex);
+                        m_parentLast = qp->kvParent ? qp->kvParent->id :
+                            (uint64_t(qp->dip.Get()) << 16) | qp->sport;
+                        if (qp->kvParent) qp->kvParent->rrBlock = qp->kvMeta.block;
 			Ptr<Packet> p = m_rdmaGetNxtPkt(m_qpGrp->Get(qIndex));
 			m_rrlast = qIndex;
 			m_qlast = qIndex;
@@ -96,6 +101,42 @@ namespace ns3 {
 		uint32_t qIndex;
 		if (!paused[ack_q_idx] && m_ackQ->GetNPackets() > 0)
 			return -1;
+
+                auto& qps = m_qpGrp->m_qps;
+                const bool grouped = std::any_of(qps.begin(), qps.end(),
+                    [](const auto& q) { return bool(q->kvParent); });
+                if (grouped) {
+                        // 先轮转父请求，再轮转它的 block，不按子 QP 数放大份额。
+                        qps.erase(std::remove_if(qps.begin(), qps.end(),
+                            [](const auto& q) { return q->IsFinished(); }), qps.end());
+                        uint64_t best = 0;
+                        bool have = false;
+                        for (const auto& q : qps) {
+                                if (paused[q->m_pg] || !q->GetBytesLeft() || q->IsWinBound() ||
+                                    q->GetEffectiveNextAvail() > Simulator::Now()) continue;
+                                const auto key = q->kvParent ? q->kvParent->id :
+                                    (uint64_t(q->dip.Get()) << 16) | q->sport;
+                                if (!have || std::make_pair(key <= m_parentLast, key) <
+                                             std::make_pair(best <= m_parentLast, best)) {
+                                        best = key; have = true;
+                                }
+                        }
+                        if (!have) return -1024;
+                        int chosen = -1024;
+                        std::pair<bool, uint32_t> rank;
+                        for (uint32_t n = 0; n < qps.size(); ++n) {
+                                auto q = qps[n];
+                                const auto key = q->kvParent ? q->kvParent->id :
+                                    (uint64_t(q->dip.Get()) << 16) | q->sport;
+                                if (key != best || paused[q->m_pg] || !q->GetBytesLeft() ||
+                                    q->IsWinBound() || q->GetEffectiveNextAvail() > Simulator::Now()) continue;
+                                const auto value = std::make_pair(
+                                    q->kvParent && q->kvMeta.block <= q->kvParent->rrBlock,
+                                    q->kvMeta.block);
+                                if (chosen == -1024 || value < rank) { rank = value; chosen = n; }
+                        }
+                        return chosen;
+                }
 
 		// no pkt in highest priority queue, do rr for each qp
 		int res = -1024;
@@ -294,9 +335,14 @@ namespace ns3 {
 			}else { // no packet to send
 				NS_LOG_INFO("PAUSE prohibits send at node " << m_node->GetId());
 				Time t = Simulator::GetMaximumSimulationTime();
-				for (uint32_t i = 0; i < m_rdmaEQ->GetFlowCount(); i++){
+                                const auto& qps = m_rdmaEQ->m_qpGrp->m_qps;
+                                const bool grouped = std::any_of(qps.begin(), qps.end(),
+                                    [](const auto& q) { return bool(q->kvParent); });
+                                for (uint32_t i = 0; i < m_rdmaEQ->GetFlowCount(); i++){
 					Ptr<RdmaQueuePair> qp = m_rdmaEQ->GetQp(i);
-					t = Min(qp->m_nextAvail, t);
+                                        if (!grouped) t = Min(qp->m_nextAvail, t);
+                                        else if (!m_paused[qp->m_pg] && qp->GetBytesLeft() && !qp->IsWinBound())
+                                                t = Min(qp->GetEffectiveNextAvail(), t);
 				}
 				if (m_nextSend.IsExpired() && t < Simulator::GetMaximumSimulationTime() && t > Simulator::Now()){
 					m_nextSend = Simulator::Schedule(t - Simulator::Now(), &QbbNetDevice::DequeueAndTransmit, this);
@@ -376,7 +422,17 @@ namespace ns3 {
 		CustomHeader ch(CustomHeader::L2_Header | CustomHeader::L3_Header | CustomHeader::L4_Header);
 		ch.getInt = 1; // parse INT header
 		packet->PeekHeader(ch);
-		if (ch.l3Prot == 0xFE){ // PFC
+                if (ch.l3Prot == LdlbLabelHeader::PROTOCOL) {
+                        if (m_node->GetNodeType() != 0)
+                                DynamicCast<SwitchNode>(m_node)->ReceiveLdlbLabel(m_ifIndex, packet);
+                        return;
+                }
+                if (ch.l3Prot == KvLoadHeader::PROTOCOL) {
+                        if (m_node->GetNodeType() != 0)
+                                DynamicCast<SwitchNode>(m_node)->ReceiveKvFeedback(m_ifIndex, packet);
+                        return;
+                }
+                if(ch.l3Prot == 0xFE){ // PFC
 			if (!m_qbbEnabled) return;
 			unsigned qIndex = ch.pfc.qIndex;
 			if (ch.pfc.time > 0){
@@ -487,6 +543,7 @@ namespace ns3 {
 		m_currentPkt = p;
 		m_phyTxBeginTrace(m_currentPkt);
 		Time txTime = m_bps.CalculateBytesTxTime(p->GetSize());
+                m_kvTxEnd = Simulator::Now().GetNanoSeconds() + txTime.GetNanoSeconds();
 		Time txCompleteTime = txTime + m_tInterframeGap;
 		NS_LOG_LOGIC("Schedule TransmitCompleteEvent in " << txCompleteTime.GetSeconds() << "sec");
 		Simulator::Schedule(txCompleteTime, &QbbNetDevice::TransmitComplete, this);
@@ -560,7 +617,16 @@ namespace ns3 {
 		m_linkUp = false;
 	}
 
-	void QbbNetDevice::UpdateNextAvail(Time t){
+        uint32_t QbbNetDevice::GetSerializationBytes() const {
+                const uint64_t now = Simulator::Now().GetNanoSeconds();
+                if (m_txMachineState != BUSY || !m_currentPkt || m_kvTxEnd <= now) return 0;
+                const auto remaining = static_cast<unsigned __int128>(m_kvTxEnd - now) *
+                                       m_bps.GetBitRate();
+                return std::min<uint64_t>(m_currentPkt->GetSize(),
+                    static_cast<uint64_t>((remaining + 7999999999ULL) / 8000000000ULL));
+        }
+
+        void QbbNetDevice::UpdateNextAvail(Time t){
 		if (!m_nextSend.IsExpired() && t < m_nextSend){
 			Simulator::Cancel(m_nextSend);
 			Time delta = t < Simulator::Now() ? Time(0) : t - Simulator::Now();

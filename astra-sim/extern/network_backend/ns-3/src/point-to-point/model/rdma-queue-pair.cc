@@ -155,6 +155,7 @@ void RdmaQueuePair::Acknowledge(uint64_t ack){
 }
 
 uint64_t RdmaQueuePair::GetOnTheFly(){
+        if (kvParent) return kvParent->inFlight;
 	return snd_nxt - snd_una;
 }
 
@@ -164,6 +165,7 @@ bool RdmaQueuePair::IsWinBound(){
 }
 
 uint64_t RdmaQueuePair::GetWin(){
+        if (kvParent) return kvParent->control->GetWin();
 	if (m_win == 0)
 		return 0;
 	uint64_t w;
@@ -193,6 +195,10 @@ uint64_t RdmaQueuePair::HpGetCurWin(){
 
 bool RdmaQueuePair::IsFinished(){
 	return snd_una >= m_size;
+}
+
+Time RdmaQueuePair::GetEffectiveNextAvail() const {
+        return kvParent ? kvParent->nextAvail : m_nextAvail;
 }
 
 /*********************

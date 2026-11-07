@@ -7,6 +7,8 @@
 #include <ns3/custom-header.h>
 #include "qbb-net-device.h"
 #include <unordered_map>
+#include <map>
+#include <set>
 #include "pint.h"
 
 namespace ns3 {
@@ -157,6 +159,28 @@ public:
 	void SetPintSmplThresh(double p);
 	void HandleAckHpPint(Ptr<RdmaQueuePair> qp, Ptr<Packet> p, CustomHeader &ch);
 	void UpdateRateHpPint(Ptr<RdmaQueuePair> qp, Ptr<Packet> p, CustomHeader &ch, bool fast_react);
+private:
+        struct KvRxParent {
+            uint64_t bytes = 0, expiry = 0;
+            uint32_t blocks = 0;
+            bool done = false;
+            std::set<uint32_t> completed;
+        };
+        std::map<uint64_t, Ptr<RdmaKvTransfer>> m_kvParents;
+        std::map<uint64_t, KvRxParent> m_kvRxParents;
+        std::map<uint64_t, uint64_t> m_kvRxExpiry;
+        std::map<std::pair<uint32_t, uint16_t>, uint64_t> m_kvPortExpiry;
+        std::unordered_map<uint32_t, uint16_t> m_kvPortCursor;
+        uint64_t m_kvCounter = 0, m_kvFillCursor = 0;
+        uint32_t m_kvActive = 0;
+        EventId m_kvRxCleanup, m_kvPortRetry;
+        void AddKvParent(Ptr<RdmaQueuePair> control);
+        void FillKvWindow();
+        uint16_t AllocateKvPort(uint32_t dip, uint16_t pg);
+        void CompleteKvBlock(Ptr<RdmaQueuePair> qp);
+        void ObserveKvReceive(Ptr<RdmaRxQueuePair>, const CustomHeader&);
+        void CleanupKvReceivers();
+        void CheckKvProgress(Ptr<RdmaKvTransfer>);
 };
 
 } /* namespace ns3 */

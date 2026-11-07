@@ -34,6 +34,8 @@
 #include <ns3/rdma.h>
 #include <ns3/sim-setting.h>
 #include <ns3/switch-node.h>
+#include <ns3/kv-routing-policy.h>
+#include <filesystem>
 #include <time.h>
 #include <unordered_map>
 
@@ -324,6 +326,7 @@ uint64_t get_nic_rate(NodeContainer &n) {
 
 bool ReadConf(string network_configuration) {
   // Read the configuration file
+  KvRoutingConfig::Get() = KvRoutingConfig{};
   std::ifstream conf;
   conf.open(network_configuration);
   if (!conf.is_open()) {
@@ -336,7 +339,9 @@ bool ReadConf(string network_configuration) {
     std::string key;
     conf >> key;
 
-    if (key.compare("ENABLE_QCN") == 0) {
+    if (KvRoutingConfig::Get().Read(key, conf)) {
+      continue;
+    } else if (key.compare("ENABLE_QCN") == 0) {
       uint32_t v;
       conf >> v;
       enable_qcn = v;
@@ -519,6 +524,14 @@ bool ReadConf(string network_configuration) {
 }
 
 void SetConfig() {
+  auto& kv = KvRoutingConfig::Get();
+  kv.mtu = packet_payload_size;
+  kv.output = std::filesystem::path(fct_output_file).parent_path().string();
+  if (kv.output.empty()) kv.output = ".";
+  kv.Validate();
+  if (KvRoutingPolicy::Create(kv.mode)->Transport() != KvTransport::LEGACY)
+    NS_ABORT_MSG_IF(cc_mode != 1, "Extended KV transport requires CC_MODE 1");
+  KvRoutingStats::Get().Open(kv);
   bool dynamicth = use_dynamic_pfc_threshold;
 
   Config::SetDefault("ns3::QbbNetDevice::PauseTime", UintegerValue(pause_time));
@@ -567,10 +580,13 @@ bool SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>)) {
     return false;
   }
 
-  uint32_t node_num, switch_num, link_num, trace_num;
-  topof >> node_num >> switch_num >> link_num;
-  flowf >> flow_num;
-  tracef >> trace_num;
+  uint32_t node_num = 0, switch_num = 0, link_num = 0, trace_num = 0;
+  if (!(topof >> node_num >> switch_num >> link_num) ||
+      !(flowf >> flow_num) || !(tracef >> trace_num) ||
+      !node_num || switch_num > node_num || trace_num > node_num) {
+    std::cerr << "Error: invalid topology, flow or trace count header" << std::endl;
+    return false;
+  }
 
   std::vector<uint32_t> node_type(node_num, 0);
   for (uint32_t i = 0; i < switch_num; i++) {
@@ -799,6 +815,9 @@ bool SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>)) {
   // setup routing
   CalculateRoutes(n);
   SetRoutingEntries();
+  for (uint32_t i = 0; i < n.GetN(); ++i)
+    if (n.Get(i)->GetNodeType() != 0)
+      DynamicCast<SwitchNode>(n.Get(i))->InitializeKvRouting();
 
   //
   // get BDP and delay
@@ -842,10 +861,10 @@ bool SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>)) {
 
   NodeContainer trace_nodes;
   for (uint32_t i = 0; i < trace_num; i++) {
-    uint32_t nid;
-    tracef >> nid;
-    if (nid >= n.GetN()) {
-      continue;
+    uint32_t nid = 0;
+    if (!(tracef >> nid) || nid >= n.GetN()) {
+      std::cerr << "Error: invalid trace node ID" << std::endl;
+      return false;
     }
     trace_nodes = NodeContainer(trace_nodes, n.Get(nid));
   }

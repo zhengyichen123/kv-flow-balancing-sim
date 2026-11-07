@@ -245,6 +245,7 @@ int num_queues_per_dim = 1;
 double comm_scale = 1;
 double injection_scale = 1;
 bool rendezvous_protocol = false;
+bool list_kv_routing_policies = false;
 auto logical_dims = vector<int>();
 int num_npus = 1;
 auto queues_per_dim = vector<int>();
@@ -311,6 +312,8 @@ void parse_args(int argc, char* argv[]) {
     cmd.AddValue("injection-scale", "Injection scale", injection_scale);
     cmd.AddValue("rendezvous-protocol", "Whether to enable rendezvous protocol",
                  rendezvous_protocol);
+    cmd.AddValue("list-kv-routing-policies", "List registered KV routing policies",
+                 list_kv_routing_policies);
 
     cmd.Parse(argc, argv);
 }
@@ -319,10 +322,13 @@ int main(int argc, char* argv[]) {
     LogComponentEnable("OnOffApplication", LOG_LEVEL_INFO);
     LogComponentEnable("PacketSink", LOG_LEVEL_INFO);
 
-    cout << "ASTRA-sim + NS3" << endl;
-
     // Read network config and find logical dims.
     parse_args(argc, argv);
+    if (list_kv_routing_policies) {
+        for (const auto& name : KvRoutingPolicy::Names()) cout << name << '\n';
+        return 0;
+    }
+    cout << "ASTRA-sim + NS3" << endl;
     AstraSim::LoggerFactory::init(logging_configuration);
     read_logical_topo_config(logical_topology_configuration, logical_dims);
 

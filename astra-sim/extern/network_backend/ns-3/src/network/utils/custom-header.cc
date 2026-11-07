@@ -101,7 +101,7 @@ uint32_t CustomHeader::GetSerializedSize (void) const{
 		else if (l3Prot == 0xFE)
 			len += 9;
 	}
-	return len;
+        return len + (kvPresent ? KvBlockHeader::SIZE : 0);
 }
 void CustomHeader::Serialize (Buffer::Iterator start) const{
   Buffer::Iterator i = start;
@@ -109,9 +109,6 @@ void CustomHeader::Serialize (Buffer::Iterator start) const{
   // ppp
   if (headerType & L2_Header){
 	  i.WriteHtonU16(pppProto);
-	  // skip 12 Bytes, so total 14 bytes as Ethernet
-	  i.WriteU64(0); // 8 bytes
-	  i.WriteU32(0); // 4 byets
   }
 
   // IPv4
@@ -174,12 +171,13 @@ void CustomHeader::Serialize (Buffer::Iterator start) const{
 		  i.WriteU16(ack.flags);
 		  i.WriteU16(ack.pg);
 		  i.WriteU32(ack.seq);
-		  udp.ih.Serialize(i);
+                  ack.ih.Serialize(i);
 	  }else if (l3Prot == 0xFE){ // PFC
 		  i.WriteU32 (pfc.time);
 		  i.WriteU32 (pfc.qlen);
 		  i.WriteU8 (pfc.qIndex);
 	  }
+          if (kvPresent) kv.Serialize(i);
   }
 }
 
@@ -187,6 +185,7 @@ uint32_t
 CustomHeader::Deserialize (Buffer::Iterator start)
 {
   Buffer::Iterator i = start;
+  kvPresent = false;
 
   // L2
   int l2Size = 0;
@@ -320,7 +319,15 @@ CustomHeader::Deserialize (Buffer::Iterator start)
 	  }
   }
 
-  return l2Size + l3Size + l4Size;
+  // 仅保留端口的 KV UDP/ACK 解析扩展头，不猜测普通载荷内容。
+  if ((l3Prot == 0x11 && udp.dport == KvBlockHeader::UDP_PORT) ||
+      ((l3Prot == 0xFC || l3Prot == 0xFD) && ack.sport == KvBlockHeader::UDP_PORT)) {
+      i = start;
+      i.Next(l2Size + l3Size + l4Size);
+      kvPresent = kv.Deserialize(i) == KvBlockHeader::SIZE;
+      NS_ABORT_MSG_IF(!kvPresent, "Invalid KV block header");
+  }
+  return l2Size + l3Size + l4Size + (kvPresent ? KvBlockHeader::SIZE : 0);
 }
 
 uint8_t CustomHeader::GetIpv4EcnBits (void) const{
@@ -340,4 +347,3 @@ uint32_t CustomHeader::GetStaticWholeHeaderSize(void){
 }
 
 } // namespace ns3
-

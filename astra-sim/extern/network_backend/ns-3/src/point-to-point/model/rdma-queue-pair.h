@@ -12,8 +12,14 @@
 
 namespace ns3 {
 
+struct RdmaKvTransfer;
+
 class RdmaQueuePair : public Object {
 public:
+        Ptr<RdmaKvTransfer> kvParent;
+        KvBlockHeader kvMeta;
+        uint64_t kvFirstTx = 0;
+        bool kvSent = false, kvCompletedParent = false;
 	Time startTime;
 	Ipv4Address sip, dip;
 	uint16_t sport, dport;
@@ -104,12 +110,27 @@ public:
 	uint64_t GetOnTheFly();
 	bool IsWinBound();
 	uint64_t GetWin(); // window size calculated from m_rate
+        Time GetEffectiveNextAvail() const;
 	bool IsFinished();
 	uint64_t HpGetCurWin(); // window size calculated from hp.m_curRate, used by HPCC
 };
 
+// 所有子 QP 共用控制器、窗口和 pacing；control 不进入 NIC 发包队列。
+struct RdmaKvTransfer : public SimpleRefCount<RdmaKvTransfer> {
+    Ptr<RdmaQueuePair> control;
+    uint64_t id = 0, request = 0, validBytes = 0, payloadBytes = 0;
+    uint64_t ready = 0, firstTx = 0, lastProgress = 0, inFlight = 0;
+    uint32_t blocks = 0, nextBlock = 0, active = 0, completed = 0, rrBlock = 0;
+    bool mega = false, done = false, sent = false, warned = false;
+    Time nextAvail;
+    EventId watchdog;
+};
+
 class RdmaRxQueuePair : public Object { // Rx side queue pair
 public:
+        uint64_t kvTransfer = 0;
+        uint32_t kvCompletedBlocks = 0;
+        bool kvDone = false;
 	struct ECNAccount{
 		uint16_t qIndex;
 		uint8_t ecnbits;

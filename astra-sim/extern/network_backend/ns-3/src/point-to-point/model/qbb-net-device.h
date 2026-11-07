@@ -41,6 +41,7 @@ public:
 	static uint32_t ack_q_idx;
 	int m_qlast;
 	uint32_t m_rrlast;
+        uint64_t m_parentLast = 0;
 	Ptr<DropTailQueuePacket> m_ackQ; // highest priority queue
 	//Ptr<RedQueue> m_ackQ;
 	Ptr<RdmaQueuePairGroup> m_qpGrp; // queue pairs
@@ -72,6 +73,8 @@ public:
 class QbbNetDevice : public PointToPointNetDevice
 {
 public:
+        uint32_t GetSerializationBytes() const;
+        uint64_t m_kvTxEnd = 0;
   static const uint32_t qCnt = 8;	// Number of queues/priorities used
 
   static TypeId GetTypeId (void);

@@ -1,4 +1,5 @@
 import re
+import subprocess
 from .logger import get_logger
 
 # ASTRA-Sim's per-iteration report, the one line of its stdout the frontend
@@ -30,6 +31,8 @@ class Controller():
         out = [""]
         while "Waiting" not in out[-1] and out[-1] != "Checking Non-Exited Systems ...\n":
             line = p.stdout.readline()
+            if line == "":
+                self._raise_backend_eof(p)
             # For debugging
             # print(line, end='')
             out.append(line)
@@ -38,11 +41,25 @@ class Controller():
     def check_end(self, p):
         out = ["",""]
         while out[-2] != "All Request Has Been Exited\n" and out[-2] != "ERROR: Some Requests Remain\n":
-            out.append(p.stdout.readline())
+            line = p.stdout.readline()
+            if line == "":
+                self._raise_backend_eof(p)
+            out.append(line)
             p.stdout.flush()
         print(out[-4], end='')
         print(out[-2], end='')
         return out
+
+    @staticmethod
+    def _raise_backend_eof(p):
+        """后端失败必须明确退出，不能在空 stdout 上忙等。"""
+        try:
+            code = p.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            p.kill()
+            code = p.wait(timeout=2)
+        error = p.stderr.read()[-8192:] if p.stderr is not None else ""
+        raise RuntimeError(f"ASTRA-Sim stdout closed before completion (exit={code}).\n{error}")
 
     def write_flush(self, p, input):
         # For debugging

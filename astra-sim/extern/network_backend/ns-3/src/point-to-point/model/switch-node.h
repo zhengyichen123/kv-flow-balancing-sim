@@ -6,6 +6,11 @@
 #include "qbb-net-device.h"
 #include "switch-mmu.h"
 #include "pint.h"
+#include "kv-routing-policy.h"
+#include "ldlb-routing.h"
+#include "ns3/random-variable-stream.h"
+#include <map>
+#include <set>
 
 namespace ns3 {
 
@@ -49,10 +54,66 @@ public:
 	void ClearTable();
 	bool SwitchReceiveFromDevice(Ptr<NetDevice> device, Ptr<Packet> packet, CustomHeader &ch);
 	void SwitchNotifyDequeue(uint32_t ifIndex, uint32_t qIndex, Ptr<Packet> p);
+        void InitializeKvRouting();
+        void ReceiveKvFeedback(uint32_t inPort, Ptr<Packet> packet);
+        void ReceiveLdlbLabel(uint32_t inPort, Ptr<Packet> packet);
 
 	// for approximate calc in PINT
 	int logres_shift(int b, int l);
 	int log2apprx(int x, int b, int m, int l); // given x of at most b bits, use most significant m bits of x, calc the result in l bits
+private:
+        struct KvPin {
+            int port = -1;
+            uint64_t remaining = 0, expiry = 0, packetCount = 0;
+            std::vector<uint64_t> admitted;
+        };
+        struct KvCached {
+            KvLoadRecord record;
+            uint64_t generated = 0;
+        };
+        struct KvAssembly {
+            uint64_t sequence = 0, generated = 0;
+            uint16_t fragments = 0;
+            std::map<uint16_t, std::vector<KvLoadRecord>> parts;
+        };
+        struct KvPending {
+            uint64_t sequence = 0, generated = 0;
+            std::vector<KvLoadRecord> records;
+            uint32_t next = 0;
+        };
+        struct KvBucket {
+            uint64_t tokens = 8000, updated = 0, lastTx = 0;
+        };
+        std::unique_ptr<KvRoutingPolicy> m_kvPolicy;
+        LdlbState m_ldlb;
+        Ptr<UniformRandomVariable> m_ldlbRandom;
+        void PollLdlbBroadcast();
+        void SampleLdlb(uint32_t port, uint32_t priority);
+        std::map<std::pair<uint64_t, uint32_t>, KvPin> m_kvPins;
+        std::map<std::pair<uint32_t, uint32_t>, KvCached> m_kvCache;
+        std::map<uint32_t, KvAssembly> m_kvAssemblies;
+        std::map<uint32_t, KvPending> m_kvPending;
+        std::map<uint32_t, KvBucket> m_kvBuckets;
+        std::map<uint32_t, uint64_t> m_kvReceivedSequence;
+        std::map<uint32_t, std::vector<KvLoadRecord>> m_kvLastAdvertised;
+        std::map<std::pair<uint32_t, int>, uint64_t> m_kvPropagation;
+        std::set<uint32_t> m_kvPropagationPending;
+        std::vector<uint64_t> m_kvReserved = std::vector<uint64_t>(pCnt, 0);
+        std::vector<uint64_t> m_kvSampleBytes = std::vector<uint64_t>(pCnt, 0);
+        EventId m_kvPeriodic, m_kvEvent, m_kvDrain, m_kvMaintenance;
+        uint64_t m_kvSequence = 0;
+        bool m_kvLastDecision = false;
+        KvRoutingContext m_kvContext;
+        KvDecision m_kvDecision;
+        Ptr<Node> KvNeighbor(uint32_t port) const;
+        uint64_t InitializeKvPropagation(uint32_t destination);
+        KvRoutingContext MakeKvContext(uint32_t destination, const KvBlockHeader* block = nullptr);
+        int SelectKvPort(const CustomHeader& ch);
+        void CommitKvPacket(int port, uint32_t inPort, Ptr<Packet>& packet, CustomHeader& ch);
+        void MarkKvDirty();
+        void EmitKvFeedback(bool periodic);
+        void DrainKvFeedback();
+        void MaintainKvState();
 };
 
 } /* namespace ns3 */

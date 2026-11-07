@@ -10,6 +10,7 @@ import os
 import subprocess
 import argparse
 import json
+import hashlib
 import shutil
 import yaml
 from time import time
@@ -163,13 +164,25 @@ def _select_ns3_topology(astra_sim, total_npu):
         % (candidates[-1][0], total_npu))
 
 
-def _prepare_ns3_config(astra_sim, run_paths, total_npu):
+def _prepare_ns3_config(astra_sim, run_paths, total_npu, kv_policy=None, topology=None):
     template = os.path.join(astra_sim, "extern/network_backend/ns-3/scratch/config/config.txt")
     output_dir = os.path.join(run_paths.inputs_root, "ns3", "output")
     ns3_dir = os.path.join(run_paths.inputs_root, "ns3")
     config_path = os.path.join(ns3_dir, "config.txt")
     logical_topology_path = os.path.join(ns3_dir, "logical_topology.json")
     os.makedirs(output_dir, exist_ok=True)
+
+    topology_source = topology or _select_ns3_topology(astra_sim, total_npu)
+    with open(topology_source, "r", encoding="utf-8") as f:
+        header = f.readline().split()
+        switches = {int(node) for node in f.readline().split()}
+    if (len(header) != 3 or len(switches) != int(header[1]) or
+            int(header[0]) - int(header[1]) < total_npu or
+            switches.intersection(range(total_npu))):
+        raise ValueError("ns3 topology must provide leading server nodes for all NPU ranks")
+    # 每次运行保留拓扑快照，切换实验时不改共享文件。
+    topology_snapshot = os.path.join(ns3_dir, "physical_topology.txt")
+    shutil.copyfile(topology_source, topology_snapshot)
 
     # The logical topology must match what the analytical backend derives from
     # network.yml: same dimension count and same size per dimension. A flat
@@ -192,7 +205,7 @@ def _prepare_ns3_config(astra_sim, run_paths, total_npu):
         json.dump({"logical-dims": [str(d) for d in dims]}, f)
 
     replacements = {
-        "TOPOLOGY_FILE": _select_ns3_topology(astra_sim, total_npu),
+        "TOPOLOGY_FILE": topology_snapshot,
         "FLOW_FILE": os.path.join(output_dir, "flow.txt"),
         "TRACE_FILE": os.path.join(output_dir, "trace.txt"),
         "TRACE_OUTPUT_FILE": os.path.join(output_dir, "mix.tr"),
@@ -202,11 +215,23 @@ def _prepare_ns3_config(astra_sim, run_paths, total_npu):
     }
 
     for path in (replacements["FLOW_FILE"], replacements["TRACE_FILE"]):
-        open(path, "w").close()
+        # 动态 SEND 不从 FLOW_FILE 读取；两种辅助文件仍需要合法计数头。
+        with open(path, "w") as f:
+            f.write("0\n")
 
     with open(template, "r", encoding="utf-8") as f:
         lines = f.readlines()
 
+    configured = next((line.split()[1] for line in lines
+                       if line.split() and line.split()[0] == "KV_ROUTING_MODE"), "ECMP")
+    mode = kv_policy or configured
+    binary = os.path.join(astra_sim, "extern/network_backend/ns-3/build/scratch/ns3.42-AstraSimNetwork-default")
+    registered = subprocess.run(
+        [binary, "--list-kv-routing-policies=1"], check=True,
+        capture_output=True, text=True, timeout=15).stdout.splitlines()
+    if mode not in registered:
+        raise ValueError(f"Unknown KV routing policy {mode!r}; registered: {registered}")
+    replacements["KV_ROUTING_MODE"] = mode
     with open(config_path, "w", encoding="utf-8") as f:
         for line in lines:
             parts = line.split(maxsplit=1)
@@ -214,6 +239,16 @@ def _prepare_ns3_config(astra_sim, run_paths, total_npu):
                 f.write(f"{parts[0]} {replacements[parts[0]]}\n")
             else:
                 f.write(line)
+        if not any(line.split() and line.split()[0] == "KV_ROUTING_MODE" for line in lines):
+            f.write(f"\nKV_ROUTING_MODE {mode}\n")
+    with open(config_path, "rb") as f:
+        config_hash = hashlib.sha256(f.read()).hexdigest()
+    with open(replacements["TOPOLOGY_FILE"], "rb") as f:
+        topology_hash = hashlib.sha256(f.read()).hexdigest()
+    with open(os.path.join(ns3_dir, "kv_run_manifest.json"), "w") as f:
+        json.dump({"policy": mode, "registered_policies": registered,
+                   "config_sha256": config_hash, "topology_sha256": topology_hash,
+                   "block_metadata_bytes": 0 if mode == "ECMP" else 72}, f, indent=2)
     return config_path, logical_topology_path
 
 
@@ -575,13 +610,17 @@ def main():
                         help='request routing policy across instances: LOAD (vLLM-style weighted least-loaded, default), '
                         'RR (round-robin), RAND (random), CUSTOM (requires implementing '
                         'the shipped NotImplementedError stub in serving/core/router.py)')
+    parser.add_argument('--decode-routing-policy', type=str, choices=['LOAD', 'RR', 'RAND', 'CUSTOM'],
+                        default=None,
+                        help='动态 P/D 配对时的 D 实例选择策略；未设置则沿用 --request-routing-policy')
     parser.add_argument('--pd-pairing', type=str, choices=['static', 'dynamic'],
                         default='static', dest='pd_pairing',
                         help='how a prefill instance picks the decode peer that receives '
                         'its KV: static (default; prefill i always pairs with decode '
                         'i %% num_decode, so a run\'s P/D flow pattern is fixed and a '
                         'routing change is the only variable between two runs), dynamic '
-                        '(re-chosen per request by --request-routing-policy)')
+                        '(re-chosen per request by --decode-routing-policy, '
+                        'falling back to --request-routing-policy)')
     parser.add_argument('--expert-routing-policy', type=str,
                         choices=['BALANCED', 'RR', 'RAND', 'CUSTOM'],
                         default='BALANCED',
@@ -693,6 +732,13 @@ def main():
                         help='logging verbosity: WARNING (minimal), INFO (per-iteration details), DEBUG (per-layer memory)')
     parser.add_argument('--network-backend', type=str, choices=['analytical', 'ns3'], default='analytical',
                         help='network simulation backend: analytical (fast, default) or ns3 (detailed, WIP)')
+    parser.add_argument('--kv-routing-policy', type=str, default=None,
+                        help='ns3 KV routing plugin name; discovered from the backend registry. '
+                        'Built-ins: ECMP, MEGA_ECMP, BLOCK_ECMP, BLOCK_LOCAL, BRBF_V1, '
+                        'MEGA_LDLB.')
+    parser.add_argument('--ns3-topology', type=str, default=None,
+                        help='physical ns3 topology file; relative paths resolve from the launch directory. '
+                        'Defaults to automatic selection by NPU count.')
 
     args = parser.parse_args()
     
@@ -702,6 +748,8 @@ def main():
     # they are standing in -- which is ``cwd``, captured before the chdir above.
     if args.gate_stats and not os.path.isabs(args.gate_stats):
         args.gate_stats = os.path.join(cwd, args.gate_stats)
+    if args.ns3_topology and not os.path.isabs(args.ns3_topology):
+        args.ns3_topology = os.path.join(cwd, args.ns3_topology)
 
     args.run_id = resolve_run_id(args.run_id)
     run_paths = build_run_paths(astra_sim, args.run_id, args.inputs_root)
@@ -760,11 +808,16 @@ def main():
     # Automatic network, memory configuration
     # If you want to set more specific information such as latency, look at config.py and each json file
     if network_backend == 'analytical':
+        if args.kv_routing_policy is not None:
+            raise ValueError("--kv-routing-policy requires --network-backend ns3")
+        if args.ns3_topology is not None:
+            raise ValueError("--ns3-topology requires --network-backend ns3")
         network=run_paths.network_config
         logical_topology=None
         binary=os.path.join(astra_sim, "build/astra_analytical/build/AnalyticalAstra/bin/AnalyticalAstra")
     elif network_backend == 'ns3':
-        network, logical_topology = _prepare_ns3_config(astra_sim, run_paths, total_npu)
+        network, logical_topology = _prepare_ns3_config(
+            astra_sim, run_paths, total_npu, args.kv_routing_policy, args.ns3_topology)
         binary=os.path.join(astra_sim, "extern/network_backend/ns-3/build/scratch/ns3.42-AstraSimNetwork-default")
     else:
         raise NotImplementedError("Only analytical and ns3 network backend are supported")
@@ -900,7 +953,8 @@ def main():
     controller = Controller(total_npu)
     # Global Request Router
     router = Router(num_instances, schedulers, num_req, request_routing_policy,
-                    pd_pairing=args.pd_pairing)
+                    pd_pairing=args.pd_pairing,
+                    decode_routing_policy=args.decode_routing_policy)
     # Power Modeling if enabled
     if power_modeling:
         power_model = PowerModel(power_configs)

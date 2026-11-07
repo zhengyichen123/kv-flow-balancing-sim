@@ -33,6 +33,7 @@ set(source_files
     utils/broadcom-egress-queue.cc
     utils/crc32.cc
     utils/custom-header.cc
+    utils/kv-routing-header.cc
     utils/data-rate.cc
     utils/drop-tail-queue.cc
     utils/drop-tail-queue-packet.cc
@@ -113,6 +114,7 @@ set(header_files
     utils/broadcom-egress-queue.h
     utils/crc32.h
     utils/custom-header.h
+    utils/kv-routing-header.h
     utils/data-rate.h
     utils/drop-tail-queue.h
     utils/drop-tail-queue-packet.h

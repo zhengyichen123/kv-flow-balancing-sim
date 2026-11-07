@@ -11,7 +11,8 @@ class Router:
             schedulers, req_num,
             routing_policy="RR",
             seed=42,
-            pd_pairing="static"
+            pd_pairing="static",
+            decode_routing_policy=None
     ):
         self.schedulers = schedulers
         self.num_instances = num_instances
@@ -21,6 +22,11 @@ class Router:
         self.decode_instances = len(self.decode_schedulers)
         self.req_num = req_num
         self.routing_policy = routing_policy.upper()
+        # 未指定 D 策略时沿用原行为；指定后与 P 侧独立选择。
+        self.decode_routing_policy = (
+            decode_routing_policy.upper() if decode_routing_policy is not None
+            else self.routing_policy
+        )
         self.seed = seed
         self.pd_pairing = pd_pairing.upper()
         if self.pd_pairing not in ("STATIC", "DYNAMIC"):
@@ -51,17 +57,16 @@ class Router:
         self._request_to_session = {}    # request_id -> (session_id, sub_request_index)
         self._next_request_id = 0        # monotonic counter for unique request IDs
 
-        if self.routing_policy == "RR":
-            self._select_instance = self._rr_select
-        elif self.routing_policy == "RAND":
-            self._select_instance = self._rand_select
-        elif self.routing_policy == "LOAD":
-            self._select_instance = self._least_load_select
-        elif self.routing_policy == "CUSTOM":
-            self._select_instance = self._custom_select
-        else:
-            raise ValueError(f"Unknown routing_policy '{routing_policy}'. "
-                             "Supported: RR, RAND, LOAD, CUSTOM")
+        selectors = {
+            "RR": self._rr_select, "RAND": self._rand_select,
+            "LOAD": self._least_load_select, "CUSTOM": self._custom_select,
+        }
+        for policy in (self.routing_policy, self.decode_routing_policy):
+            if policy not in selectors:
+                raise ValueError(f"Unknown routing_policy '{policy}'. "
+                                 "Supported: RR, RAND, LOAD, CUSTOM")
+        self._select_instance = selectors[self.routing_policy]
+        self._select_decode_instance = selectors[self.decode_routing_policy]
         self.logger = get_logger(self.__class__)
 
     # -----------------------------------------------------------------------
@@ -244,7 +249,7 @@ class Router:
                 if self.pd_pairing == "STATIC":
                     decode_id = self._static_pd_pair[instance_id]
                 else:
-                    decode_id = self._select_instance(self.decode_schedulers, "decode")
+                    decode_id = self._select_decode_instance(self.decode_schedulers, "decode")
                 decode_sched = self.decode_schedulers[decode_id]
                 # Recorded on the prefill-side object too: _build_batch reads it
                 # to bucket each layer's KV bytes by receiving instance.
@@ -356,4 +361,3 @@ class Router:
                 scheduler.instance_id,
                 scheduler.pd_type
             )
-
