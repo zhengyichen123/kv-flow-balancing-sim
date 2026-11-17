@@ -781,11 +781,9 @@ class Scheduler:
     def add_decode(self, req):
         """Take over a request whose prefill runs on another instance.
 
-        The KV transfer itself is charged by the graphs: the prefill instance's
-        trace carries a per-layer send to this instance, and this instance's
-        trace carries the matching per-layer receive. So this only claims the
-        blocks -- reporting no load bytes, or the transfer would be billed
-        twice.
+        KV 由任务图计费：完整 prefill 后每请求发送一次整份 KV，
+        decode 的计算等待对应整份接收完成。这里仅申请 KV 块，
+        不再次记 load 字节，避免重复计费。
 
         ``req`` is the prefill-side object and is left untouched: the router
         pairs the two instances at arrival time, long before prefill has run,

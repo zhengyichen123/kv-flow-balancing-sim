@@ -393,7 +393,7 @@ Python 仍生成每请求整份 KV 的 SEND/RECV 计划；C++ 根据同一运行
 
 ### 9.2 当前已实施的每请求 ECMP 基线
 
-正常 serving 的 KV trace 使用 `peer_npu_offset:request_id:bytes`，保留同批、同目的端的不同请求。Chakra 在最后一个 KV 层生成各自的整份 SEND，在 decode 第一层生成各自的整份 RECV；配对标签为 `(1<<20)+request_id`。
+正常 serving 的 KV trace 使用 `peer_npu_offset:request_id:bytes`，保留同批、同目的端的不同请求。Chakra 将每请求全部层的 KV 汇总成一个 SEND/RECV：SEND 依赖完整 prefill 图的计算和通信节点（包含最终层、lm_head、sampler），所有 decode 计算节点依赖本批整份 KV RECV 完成；配对标签为 `(1<<20)+request_id`。当前完整屏障支持 PP=1、各 TP rank 的本地 KV 分片；带 KV 的 PP>1 配置明确拒绝，避免把局部 stage 的完成错误解释为完整 prefill。
 
 prefill 计算仍可分块、合批，但本轮只实现“完整 prefill 后一次传输”，不实现中间计算块的流式 KV 发射。正常 TP=1、PP=1 的一次完整 KV 请求对应一个 QP；TP/PP 配置可能产生多个 rank 分片，不能承诺所有配置的 QP 数都等于请求数。
 
@@ -756,7 +756,7 @@ pd_kv_send_tokens[(decode_instance_id, request_id)] = original_input
 
 第一次 decode 建立对应接收 token 计划。`request.py::Batch` 保存这些字段，计算仍按原 batch 执行。
 
-`trace_generator.py::_pd_kv_peers()` 根据模型 KV head、head dimension、KV dtype 和 TP 分片换算逐层字节，输出 `peer_npu_offset:request_id:bytes`。`_coalesce_pd_kv_sends()` 把同请求逐层 KV 汇到完整发送位置，P 在最后载体层发送，D 在第一载体层等待，不合并不同请求。
+`trace_generator.py::_pd_kv_peers()` 根据模型 KV head、head dimension、KV dtype 和 TP 分片换算逐层字节，输出 `peer_npu_offset:request_id:bytes`。`_coalesce_pd_kv_sends()` 按请求实际累加各层字节，不再用单层大小乘载体数；载体列仅用于传递完整字节计划，不决定发送或接收的时机。转换器在完整 prefill 图结束后释放发送，在任何 decode 计算前建立接收屏障，不合并不同请求。
 
 `graph_generator.py::_get_llm_converter()` 优先加载：
 
@@ -766,7 +766,7 @@ astra-sim/extern/graph_frontend/chakra/src/converter/llm_converter.py
 
 转换器为每个请求生成 SEND/RECV，写入 `kv_request_id:uint64` 辅助属性，并使用 `comm_tag=(1<<20)+request_id` 配对。当前 RDMA 父对象实际从 tag 恢复 RequestID；并不是直接读取这个辅助属性创建 ParentTransferID。
 
-当前多个 KV SEND 在同一发送 rank 的任务图中仍有串行依赖。网络层支持并发父传输，但 serving 图不保证同源请求一起发射。这会限制实际网络压力，sps20 到达率也不能直接当作网络传输到达率。
+修正后的多个请求 KV SEND 在同一发送 rank 的任务图中共用 prefill 完成屏障，彼此不建立串行依赖。ASTRA-Sim 的资源调度和网络拥塞控制仍可能限制实际并发，不能仅凭图无串行边就承诺同源父对象同时在途；sps20 到达率也不能直接当作网络传输到达率。
 
 ### 17.2 创建控制父对象
 

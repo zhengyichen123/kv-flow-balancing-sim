@@ -2713,6 +2713,11 @@ Letting a new build take that poll instead is what hung `dp>1 x pp>1`: the NPU r
 by `id - 1`, and the other pipeline stage waited forever on a RECV that never came.
 
 ### Chakra graph converter
+PD KV 在 PP=1 下使用整份请求屏障：完整 prefill 的计算和通信完成后
+释放聚合 SEND；所有 decode 计算节点等待本批整份 RECV 完成。
+KV 载体列仅是字节元数据，不表示在该层后发送；不同请求保留独立标签和载荷。
+带 KV 的 PP>1 暂时拒绝，不能用局部 stage 完成代替完整实例屏障。
+
 The Chakra converter (`astra-sim/extern/graph_frontend/chakra/src/converter/llm_converter.py`)
 transforms text traces into protobuf `.et` files. It creates:
 - `MEM_LOAD_NODE` for the first layer's input (from REMOTE/CPU memory)

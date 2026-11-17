@@ -71,17 +71,17 @@ for sps in "${sps_values[@]}"; do
       symmetric)
         scen_code=sym
         topology="${topology_dir}/pd_kv_16gpu_fabric40g.txt"
-        policies=(ECMP MEGA_ECMP BLOCK_ECMP BLOCK_LOCAL BRBF_V1 MEGA_LDLB)
+        policies=(MEGA_ECMP MEGA_LDLB BLOCK_ECMP BLOCK_LOCAL BRBF_V1)
         ;;
       local25g)
         scen_code=loc25
         topology="${topology_dir}/pd_kv_16gpu_local25g.txt"
-        policies=(BLOCK_ECMP BLOCK_LOCAL BRBF_V1 MEGA_LDLB)
+        policies=(MEGA_ECMP MEGA_LDLB BLOCK_ECMP BLOCK_LOCAL BRBF_V1)
         ;;
       downstream25g)
         scen_code=ds25
         topology="${topology_dir}/pd_kv_16gpu_downstream25g.txt"
-        policies=(BLOCK_ECMP BLOCK_LOCAL BRBF_V1 MEGA_LDLB)
+        policies=(MEGA_ECMP MEGA_LDLB BLOCK_ECMP BLOCK_LOCAL BRBF_V1)
         ;;
     esac
     for policy in "${policies[@]}"; do

@@ -2051,18 +2051,9 @@ def _emit_resolved_sequence(ctx, bctx, layer_num, layers, lines, power_acc, batc
             _emit_layer(ctx, bctx, layer_name, lines, power_acc, batch_tag, layer_num,
                         comm_type=_with_dim(comm_type, ctx.tp_dim), comm_size=comm_size)
         elif layer_name == 'qkv_proj' and ctx.pd_type in ('prefill', 'decode'):
-            # P/D disaggregation: this layer's KV has to cross to the other
-            # instance. Which instance that is -- and how many bytes -- comes
-            # from the batch, split per peer, and lands in the trace's own
-            # ``kv_peers`` column rather than ``comm_size``: one batch can mix
-            # requests bound for different decode instances, and a Chakra send
-            # node carries exactly one destination. ``comm_size`` keeps its
-            # collective meaning; the converter reads the split from the extra
-            # column.
-            #
-            # Both directions are emitted here because the converter needs a
-            # matching SEND (prefill) and RECV (decode) per layer, and the tag
-            # that pairs them is derived from the peer and layer index.
+            # 按层计入本层 KV 字节，保留请求和对端身份，之后汇成整份计划。
+            # 此处只生成元数据，不表示在 QKV 投影后立即发包。
+            # comm_size 仍表示集合通信，KV 字节使用独立载体列。
             _emit_layer(ctx, bctx, layer_name, lines, power_acc, batch_tag, layer_num,
                         kv_peers=_pd_kv_peers(ctx, bctx))
         else:
@@ -2416,19 +2407,21 @@ def _coalesce_pd_kv_sends(rows, pd_type):
     """合并同一请求的逐层 KV，不合并不同请求。
 
     新格式是 peer:request_id:bytes，旧格式 peer:bytes 仍可转换。
-    P 保留最后一层的发送位置，D 保留第一层的接收屏障。
+    这里只汇总字节；完整 prefill 后发送、decode 前接收的屏障由转换器建立。
     """
     kv_col = 11
     carriers = [i for i, r in enumerate(rows)
                 if len(r) > kv_col and r[kv_col] not in ('-', '')]
-    if len(carriers) <= 1:
+    if not carriers:
         return
     keep = carriers[-1] if pd_type == 'prefill' else carriers[0]
-    scaled_parts = []
-    for pair in rows[keep][kv_col].split(','):
-        *identity, nbytes = pair.split(':')
-        scaled_parts.append(f"{':'.join(identity)}:{int(nbytes) * len(carriers)}")
-    scaled = ','.join(scaled_parts)
+    # 各层、各子批的请求集合和字节可能不同，必须逐身份累加。
+    totals = {}
+    for i in carriers:
+        for part in rows[i][kv_col].split(','):
+            identity, nbytes = part.rsplit(':', 1)
+            totals[identity] = totals.get(identity, 0) + int(nbytes)
+    scaled = ','.join(f"{identity}:{nbytes}" for identity, nbytes in sorted(totals.items()))
     rows[keep] = rows[keep][:kv_col] + (scaled,) + rows[keep][kv_col + 1:]
     for i in carriers:
         if i != keep:
@@ -2528,9 +2521,6 @@ def _synthesize_trace(hardware, model, config, tp_size, pp_size, local_ep, ep_to
     _emit_final_layers(ctx, bctx, rows)
     _emit_drafter(ctx, bctx, rows, str(batch.batch_id))
     _emit_pp_pd_power(ctx, bctx)
-
-    # One prefill->decode KV transfer per request, not one per layer.
-    _coalesce_pd_kv_sends(rows, pd_type)
 
     return rows, block_starts
 
@@ -2792,6 +2782,8 @@ def generate_trace(batch, hardware, tp_size, pp_size, local_ep, ep_total, pd_typ
                 )
             rows, block_starts = _synthesize_interleaved_trace(*synth_args, batches, max_len, **synth_kwargs)
 
+    # 普通和交错子批都逐请求汇总，图转换器统一建立完整传输屏障。
+    _coalesce_pd_kv_sends(rows, pd_type)
     stage_boundaries = _pp_stage_boundaries(block_starts, pp_size)
 
     # vllm: prepend the load / evict rows
